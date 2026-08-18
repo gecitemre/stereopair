@@ -86,20 +86,30 @@ def watch():
     settle = 1.5
     state = {"peer": None}
 
-    reader = subprocess.Popen(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15",
-         "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/stereo-vol-%r@%h:%p",
-         "-o", "ControlPersist=300", os.environ["PEER"],
-         "while true; do osascript -e 'output volume of (get volume settings)'; sleep 0.4; done"],
-        stdout=subprocess.PIPE, text=True, bufsize=1)
+    def start_reader():
+        """Stream the other Mac's level over one persistent ssh session, rather
+        than paying for a new connection on every poll."""
+        process = subprocess.Popen(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15",
+             "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/stereo-vol-%r@%h:%p",
+             "-o", "ControlPersist=300", os.environ["PEER"],
+             # Loop on osascript's exit status rather than `while true`: when
+             # this ssh session dies, the write fails and the loop ends. With
+             # `while true` the remote loop outlives every disconnect and they
+             # pile up on the other Mac, one per reconnect.
+             "while osascript -e 'output volume of (get volume settings)'; do sleep 0.4; done"],
+            stdout=subprocess.PIPE, text=True, bufsize=1)
 
-    def pump():
-        for line in reader.stdout:
-            line = line.strip()
-            if line.isdigit():
-                state["peer"] = int(line)
+        def pump():
+            for line in process.stdout:
+                line = line.strip()
+                if line.isdigit():
+                    state["peer"] = int(line)
 
-    threading.Thread(target=pump, daemon=True).start()
+        threading.Thread(target=pump, daemon=True).start()
+        return process
+
+    reader = start_reader()
 
     # Start from the quieter of the two. Adopting this Mac's level instead would
     # yank the other machine up to meet it, which is a nasty surprise on speakers.
@@ -116,8 +126,16 @@ def watch():
 
     while True:
         time.sleep(0.3)
+
+        # The other Mac sleeping, or Wi-Fi dropping, kills the ssh session.
+        # Reconnect rather than exiting: this is meant to be left running.
         if reader.poll() is not None:
-            sys.exit("volume: lost the connection to the second Mac")
+            state["peer"] = None
+            time.sleep(2)
+            reader = start_reader()
+            quiet_until = time.time() + settle
+            continue
+
         if time.time() < quiet_until:
             continue
 

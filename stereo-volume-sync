@@ -1,0 +1,46 @@
+#!/bin/bash
+# start | stop | status the watcher that keeps both Macs at the same level.
+# Independent of the audio rig: it only needs ssh to the second Mac.
+set -uo pipefail
+cd "$(dirname "$0")"
+source ./config.sh
+
+RUN="$PWD/run"
+mkdir -p "$RUN"
+PIDFILE="$RUN/volume.pid"
+
+running() {
+	[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+case "${1:-status}" in
+start)
+	if running; then
+		echo "volume sync already running"
+		exit 0
+	fi
+	# No --match here: the watcher levels the two to the quieter of them on
+	# startup, which will never raise a machine unexpectedly.
+	PEER="$PEER" python3 bin/volume.py --watch > "$RUN/volume.log" 2>&1 &
+	echo $! > "$PIDFILE"
+	echo "volume sync started"
+	;;
+stop)
+	if running; then
+		kill "$(cat "$PIDFILE")" 2>/dev/null
+	fi
+	rm -f "$PIDFILE"
+	# The watcher leaves a polling loop on the other Mac behind if it is killed
+	# before it can tear the ssh session down.
+	ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+		"pkill -f 'get volume settings'" 2>/dev/null
+	echo "volume sync stopped"
+	;;
+status)
+	running && echo "running" || echo "stopped"
+	;;
+*)
+	echo "usage: stereo-volume-sync [start|stop|status]" >&2
+	exit 1
+	;;
+esac

@@ -56,9 +56,9 @@ python3 bin/assign.py
 
 # Keep the second Mac's volume glued to this one's, so the hardware volume keys
 # move both speakers together instead of tilting the stereo image.
-PEER="$PEER" python3 bin/volume.py --match > /dev/null 2>&1 || true
-PEER="$PEER" python3 bin/volume.py --watch > /dev/null 2>&1 &
-echo $! > "$RUN/volume.pid"
+if [ "$SYNC_VOLUME" = 1 ]; then
+	./stereo-volume-sync start
+fi
 
 # Must come last: the tap excludes the local snapclient so its playback is not
 # captured back into the stream, and `open` gives the app its own TCC identity

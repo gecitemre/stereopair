@@ -7,7 +7,14 @@ RUN="$PWD/run"
 # Stop the tap first so apps stop being muted even if the rest hangs.
 pkill -f 'StereoTap.app/Contents/MacOS/stereotap' 2>/dev/null
 
-for name in volume snapclient snapserver; do
+# Only tear down volume sync when we own it. The menu bar app toggles the two
+# independently and passes SYNC_VOLUME=0, so stopping audio must leave the
+# volume watcher alone.
+if [ "$SYNC_VOLUME" = 1 ]; then
+	./stereo-volume-sync stop > /dev/null 2>&1
+fi
+
+for name in snapclient snapserver; do
 	if [ -f "$RUN/$name.pid" ]; then
 		kill "$(cat "$RUN/$name.pid")" 2>/dev/null
 		rm -f "$RUN/$name.pid"

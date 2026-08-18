@@ -1,4 +1,4 @@
-# stereo
+# stereopair
 
 Use two Macs as one stereo pair. The Mac you're working on plays the left
 channel, a second Mac plays the right, sample-synced, from whatever audio is
@@ -9,6 +9,12 @@ The two halves of this exist separately (Airfoil syncs audio to several
 machines but [doesn't do stereo pairs](https://rogueamoeba.com/support/manuals/airfoil/?page=usage);
 Loopback splits channels but only locally). As far as I can tell, nobody has
 shipped the combination on macOS.
+
+```bash
+open bin/StereoMenu.app     # menu bar toggles for stereo sync and volume sync
+```
+
+or from the terminal:
 
 ```bash
 ./stereo-start
@@ -32,9 +38,9 @@ ssh-copy-id you@other-mac.local          # once, asks for that Mac's password
 cp config.local.sh.example config.local.sh
 $EDITOR config.local.sh                  # set PEER=you@other-mac.local
 
-./build.sh          # builds and signs StereoTap.app
+./build.sh          # builds StereoTap.app and StereoMenu.app
 ./deploy-peer.sh    # ships snapclient to the second Mac as SnapRight.app
-./stereo-start
+open bin/StereoMenu.app
 ```
 
 Then grant two permissions, both of which are described below. `./stereo-doctor`
@@ -131,7 +137,12 @@ is the same gain, so no curve mapping is involved.
 ./stereo-volume 60 --trim-right -8   # keep the right side 8 points quieter
 ```
 
-Trims persist in `run/trim.json`.
+Trims persist in `run/trim.json`. The watcher levels the two machines to the
+*quieter* of them when it starts, so enabling it never raises a machine
+unexpectedly.
+
+Stereo sync and volume sync are independent — the menu bar app toggles each on
+its own, and `SYNC_VOLUME=0 ./stereo-start` skips the watcher from the terminal.
 
 ## Placement
 
@@ -147,9 +158,11 @@ off to one side is worse than either.
 | | |
 |---|---|
 | `src/stereotap.swift` | Core Audio tap: captures system audio, splits L/R into two FIFOs |
-| `build.sh` | Builds and signs `bin/StereoTap.app` |
+| `build.sh` | Builds and signs both app bundles |
 | `deploy-peer.sh` | Bundles snapclient + dylibs into `SnapRight.app`, ships it to the peer |
 | `stereo-start` / `stereo-stop` | Bring the rig up and down |
+| `src/StereoMenu.swift` | Menu bar app: toggles for stereo sync and volume sync |
+| `stereo-volume-sync` | `start` / `stop` / `status` the volume watcher on its own |
 | `stereo-doctor` | Checks prerequisites and both silent-failure permissions |
 | `stereo-volume` | Show/set both levels, per-side trims |
 | `bin/assign.py` | Puts each client in its own group and points it at its channel |

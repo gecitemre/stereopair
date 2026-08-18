@@ -1,17 +1,21 @@
 #!/bin/bash
-# Builds stereotap into a signed .app bundle. Core Audio process taps are gated
-# behind a TCC permission that is only grantable to a bundled, signed app —
-# a bare binary gets silence with no error.
+# Builds both app bundles. They have to be bundled and signed, not bare
+# binaries: the audio tap's permission is granted to the app that launches the
+# process, and a bare binary gets silence with no error.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="bin/StereoTap.app"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p bin
 
-swiftc -O -o "$APP/Contents/MacOS/stereotap" src/stereotap.swift
+# --- StereoTap.app: captures system audio and splits it -----------------------
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+TAP="bin/StereoTap.app"
+rm -rf "$TAP"
+mkdir -p "$TAP/Contents/MacOS"
+
+swiftc -O -o "$TAP/Contents/MacOS/stereotap" src/stereotap.swift
+
+cat > "$TAP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -38,7 +42,43 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - --identifier com.emre.stereotap "$APP"
+codesign --force --sign - --identifier com.emre.stereotap "$TAP"
 ln -sf StereoTap.app/Contents/MacOS/stereotap bin/stereotap
 
-echo "built $APP"
+# --- StereoMenu.app: the menu bar toggles ------------------------------------
+
+MENU="bin/StereoMenu.app"
+rm -rf "$MENU"
+mkdir -p "$MENU/Contents/MacOS"
+
+swiftc -O -o "$MENU/Contents/MacOS/StereoMenu" src/StereoMenu.swift
+
+cat > "$MENU/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>StereoMenu</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.emre.stereomenu</string>
+	<key>CFBundleName</key>
+	<string>StereoMenu</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.4</string>
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+
+codesign --force --sign - --identifier com.emre.stereomenu "$MENU"
+
+echo "built $TAP and $MENU"
+echo "menu bar app: open $MENU"

@@ -1,6 +1,7 @@
 run/
 build/
 bin/StereoTap.app/
+bin/StereoMenu.app/
 bin/stereotap
 bin/__pycache__/
 config.local.sh

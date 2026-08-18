@@ -12,6 +12,10 @@ BUFFER="${BUFFER:-500}"
 # Network interface used to reach the second Mac.
 IFACE="${IFACE:-en0}"
 
+# Whether stereo-start also starts the volume watcher. The menu bar app sets
+# this to 0 and manages the watcher itself, so the two can be toggled apart.
+SYNC_VOLUME="${SYNC_VOLUME:-1}"
+
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/config.local.sh" ]; then
 	source "$(dirname "${BASH_SOURCE[0]}")/config.local.sh"
 fi
