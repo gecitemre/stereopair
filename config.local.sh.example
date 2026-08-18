@@ -1,0 +1,6 @@
+# Your machine-specific settings. Copy to config.local.sh and edit.
+PEER="you@other-mac.local"
+
+# Optional overrides:
+# BUFFER=500
+# IFACE=en0

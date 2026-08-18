@@ -1,0 +1,8 @@
+#!/bin/bash
+# stereo-volume            show both levels
+# stereo-volume 60         set both to 60
+# stereo-volume 60 --trim-right -8   set both, keeping the right side 8 quieter
+set -euo pipefail
+cd "$(dirname "$0")"
+source ./config.sh
+PEER="$PEER" python3 bin/volume.py "$@"

@@ -1,0 +1,92 @@
+#!/bin/bash
+# Checks the things that fail silently. Both macOS permissions this depends on
+# report success and then do nothing — the tap returns digital silence, and the
+# remote client's connections are dropped with a misleading "No route to host".
+# Neither shows an error, so check them directly rather than trusting a log.
+cd "$(dirname "$0")"
+source ./config.sh
+
+pass() { printf "  \033[32mok\033[0m    %s\n" "$1"; }
+warn() { printf "  \033[33mwarn\033[0m  %s\n" "$1"; }
+bad()  { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; FAILED=1; }
+FAILED=0
+
+echo "prerequisites"
+command -v snapserver >/dev/null && pass "snapserver installed" || bad "snapserver missing — brew install snapcast"
+command -v snapclient >/dev/null && pass "snapclient installed" || bad "snapclient missing — brew install snapcast"
+command -v swiftc >/dev/null && pass "swift toolchain" || bad "swiftc missing — install Xcode or the command line tools"
+[ -d bin/StereoTap.app ] && pass "StereoTap.app built" || bad "not built — run ./build.sh"
+
+echo
+echo "second Mac ($PEER)"
+if ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" true 2>/dev/null; then
+	pass "reachable over ssh with a key"
+	if ssh -o BatchMode=yes "$PEER" 'test -x ~/stereo-right/SnapRight.app/Contents/MacOS/snapclient' 2>/dev/null; then
+		pass "SnapRight.app deployed"
+	else
+		bad "SnapRight.app not deployed — run ./deploy-peer.sh"
+	fi
+else
+	bad "cannot ssh to $PEER — enable Remote Login there, then ssh-copy-id $PEER"
+fi
+
+echo
+echo "system audio recording permission (this Mac)"
+# Creating a tap succeeds even when permission is denied; it just yields
+# silence. So capture a real tone and look at it.
+if [ -d bin/StereoTap.app ] && command -v ffmpeg >/dev/null && command -v sox >/dev/null; then
+	TMP=$(mktemp -d)
+	ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=f=440:r=48000:d=2" \
+		-af "volume=0.08" -ac 2 -y "$TMP/probe.wav" 2>/dev/null
+	: > "$TMP/l.raw"; : > "$TMP/r.raw"
+	open -n bin/StereoTap.app --args --mute unmuted --left "$TMP/l.raw" --right "$TMP/r.raw" 2>/dev/null
+	sleep 2
+	afplay "$TMP/probe.wav" 2>/dev/null
+	pkill -f "$TMP/l.raw" 2>/dev/null
+	PEAK=$(sox -t raw -r 48000 -b 16 -e signed -c 1 "$TMP/l.raw" -n stat 2>&1 |
+		awk '/Maximum amplitude/ {print ($3 > 0.0001) ? "yes" : "no"}')
+	if [ "$PEAK" = "yes" ]; then
+		pass "tap captures audio"
+	else
+		bad "tap returns silence — allow StereoTap under System Settings >"
+		echo "        Privacy & Security > Screen & System Audio Recording."
+		echo "        Launch it with 'open', never a bare binary: the permission is"
+		echo "        charged to whichever app started the process."
+	fi
+	rm -rf "$TMP"
+else
+	warn "skipped (needs ffmpeg and sox: brew install ffmpeg sox)"
+fi
+
+echo
+echo "local network permission (second Mac)"
+if ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" true 2>/dev/null; then
+	LOG=$(ssh -o BatchMode=yes "$PEER" 'tail -40 ~/stereo-right/snapclient.log 2>/dev/null' 2>/dev/null)
+	if echo "$LOG" | grep -q "No route to host"; then
+		bad "connections are being blocked — allow SnapRight under System Settings >"
+		echo "        Privacy & Security > Local Network on the second Mac."
+		echo "        'No route to host' here means policy, not networking: ping and"
+		echo "        nc to the same port will succeed."
+	elif echo "$LOG" | grep -q "Sampleformat"; then
+		pass "client has connected and opened a stream"
+	else
+		warn "no history yet — run ./stereo-start, then re-run this"
+	fi
+fi
+
+echo
+echo "levels"
+LOCAL_VOL=$(osascript -e 'output volume of (get volume settings)' 2>/dev/null)
+PEER_VOL=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" \
+	'osascript -e "output volume of (get volume settings)"' 2>/dev/null)
+if [ -n "$LOCAL_VOL" ] && [ -n "$PEER_VOL" ]; then
+	if [ "$((LOCAL_VOL - PEER_VOL))" -le 4 ] && [ "$((PEER_VOL - LOCAL_VOL))" -le 4 ]; then
+		pass "system volumes match ($LOCAL_VOL / $PEER_VOL)"
+	else
+		warn "system volumes differ ($LOCAL_VOL vs $PEER_VOL) — the sides will not match"
+	fi
+fi
+
+echo
+[ "$FAILED" = 0 ] && echo "all good." || echo "fix the FAIL lines above, then re-run."
+exit "$FAILED"

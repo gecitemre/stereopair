@@ -1,0 +1,8 @@
+run/
+build/
+bin/StereoTap.app/
+bin/stereotap
+bin/__pycache__/
+config.local.sh
+channel-check.wav
+.DS_Store

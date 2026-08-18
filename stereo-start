@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ./config.sh
+
+RUN="$PWD/run"
+mkdir -p "$RUN"
+
+./stereo-stop >/dev/null 2>&1 || true
+
+LOCAL_IP=$(ipconfig getifaddr "$IFACE")
+[ -n "$LOCAL_IP" ] || { echo "stereo: no address on $IFACE"; exit 1; }
+
+wait_for_port() {
+	for _ in $(seq 1 50); do
+		nc -z 127.0.0.1 "$1" 2>/dev/null && return 0
+		sleep 0.2
+	done
+	echo "stereo: port $1 never opened, see $RUN/snapserver.log"
+	exit 1
+}
+
+cat > "$RUN/snapserver.conf" <<EOF
+[server]
+datadir = $RUN
+
+[stream]
+source = pipe://$RUN/left?name=left&sampleformat=48000:16:1&codec=pcm
+source = pipe://$RUN/right?name=right&sampleformat=48000:16:1&codec=pcm
+sampleformat = 48000:16:1
+codec = pcm
+chunk_ms = 20
+buffer = $BUFFER
+EOF
+
+snapserver -c "$RUN/snapserver.conf" > "$RUN/snapserver.log" 2>&1 &
+echo $! > "$RUN/snapserver.pid"
+wait_for_port 1705
+
+# Redirect stdout/stderr to a file, not just --logsink: a background child that
+# inherits the terminal keeps the calling shell's pipe open and the script
+# appears to hang after it has already finished.
+snapclient --hostID stereo-left --logsink "file:$RUN/snapclient.log" \
+	tcp://127.0.0.1:1704 > /dev/null 2>&1 &
+echo $! > "$RUN/snapclient.pid"
+
+# Launch through `open` so the client runs as a bundled app with its own
+# identity; a bare binary's LAN connections are dropped by Local Network policy.
+# The bracket in the kill pattern stops pkill matching this command line itself.
+ssh -o BatchMode=yes "$PEER" \
+	"pkill -f 'SnapRight[.]app/Contents/MacOS/snapclient' 2>/dev/null; \
+	 open -n ~/stereo-right/SnapRight.app --args --hostID stereo-right \
+	   --logsink file:\$HOME/stereo-right/snapclient.log tcp://$LOCAL_IP:1704"
+
+python3 bin/assign.py
+
+# Keep the second Mac's volume glued to this one's, so the hardware volume keys
+# move both speakers together instead of tilting the stereo image.
+PEER="$PEER" python3 bin/volume.py --match > /dev/null 2>&1 || true
+PEER="$PEER" python3 bin/volume.py --watch > /dev/null 2>&1 &
+echo $! > "$RUN/volume.pid"
+
+# Must come last: the tap excludes the local snapclient so its playback is not
+# captured back into the stream, and `open` gives the app its own TCC identity
+# (a tap inherited from a parent process is silently denied).
+open -n bin/StereoTap.app --args \
+	--exclude-pid "$(cat "$RUN/snapclient.pid")" \
+	--left "$RUN/left" --right "$RUN/right" --log "$RUN/stereotap.log"
+
+echo
+echo "stereo is up. left = this Mac, right = $PEER"
+echo "  control ui   http://localhost:1780"
+echo "  stop with    ./stereo-stop"
