@@ -2,27 +2,17 @@
 cd "$(dirname "$0")"
 source ./config.sh
 
-RUN="$PWD/run"
+# The bracket keeps pkill from matching this command line itself.
+pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair' 2>/dev/null
 
-# Stop the tap first so apps stop being muted even if the rest hangs.
-pkill -f 'StereoTap.app/Contents/MacOS/stereotap' 2>/dev/null
+ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+	"pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair'" 2>/dev/null
 
 # Only tear down volume sync when we own it. The menu bar app toggles the two
-# independently and passes SYNC_VOLUME=0, so stopping audio must leave the
-# volume watcher alone.
+# independently and passes SYNC_VOLUME=0.
 if [ "$SYNC_VOLUME" = 1 ]; then
 	./stereo-volume-sync stop > /dev/null 2>&1
 fi
 
-for name in snapclient snapserver; do
-	if [ -f "$RUN/$name.pid" ]; then
-		kill "$(cat "$RUN/$name.pid")" 2>/dev/null
-		rm -f "$RUN/$name.pid"
-	fi
-done
-
-ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
-	"pkill -f 'SnapRight[.]app/Contents/MacOS/snapclient'" 2>/dev/null
-
-rm -f "$RUN/left" "$RUN/right"
+rm -f "$PWD/run/stereopair.pid"
 echo "stereo stopped"

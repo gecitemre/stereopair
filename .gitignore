@@ -7,3 +7,5 @@ bin/__pycache__/
 config.local.sh
 channel-check.wav
 .DS_Store
+bin/StereoPair.app/
+bin/Lowlat.app/

@@ -6,20 +6,23 @@
 # or a default would be indistinguishable from something you actually asked for
 # and would override config.local.sh.
 _env_peer="${PEER:-}"
-_env_buffer="${BUFFER:-}"
+_env_target="${TARGET_MS:-}"
 _env_iface="${IFACE:-}"
 _env_sync_volume="${SYNC_VOLUME:-}"
 
 # The second Mac, as user@host. It plays the right channel.
 PEER="${PEER:-}"
 
-# Snapcast playback buffer in ms: how far behind real time both Macs play, and
-# the headroom that absorbs network jitter. Too low and a client starves and
-# exits. "auto" follows the link, which matters because a value tuned for the
-# wired link will starve clients over Wi-Fi.
-BUFFER="${BUFFER:-auto}"
-BUFFER_WIRED="${BUFFER_WIRED:-350}"      # measured floor over Thunderbolt
-BUFFER_WIRELESS="${BUFFER_WIRELESS:-500}" # measured floor over Wi-Fi
+# How much audio each Mac holds before playing, in ms. This is the whole
+# latency budget and the only thing absorbing network jitter. "auto" follows the
+# link: a value tuned for the cable cannot survive Wi-Fi, whose jitter alone is
+# around 29 ms.
+TARGET_MS="${TARGET_MS:-auto}"
+TARGET_WIRED="${TARGET_WIRED:-20}"       # measured stable over Thunderbolt
+TARGET_WIRELESS="${TARGET_WIRELESS:-150}" # Wi-Fi needs far more; not yet tuned
+
+# Output IO buffer in frames. 128 = 2.67 ms. The hardware floor is 15.
+IO_FRAMES="${IO_FRAMES:-128}"
 
 # Interface the second Mac connects back on. "auto" uses a direct Thunderbolt
 # cable when both Macs can actually reach each other over it, else Wi-Fi.
@@ -35,10 +38,10 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/config.local.sh" ]; then
 fi
 
 [ -n "$_env_peer" ] && PEER="$_env_peer"
-[ -n "$_env_buffer" ] && BUFFER="$_env_buffer"
+[ -n "$_env_target" ] && TARGET_MS="$_env_target"
 [ -n "$_env_iface" ] && IFACE="$_env_iface"
 [ -n "$_env_sync_volume" ] && SYNC_VOLUME="$_env_sync_volume"
-unset _env_peer _env_buffer _env_iface _env_sync_volume
+unset _env_peer _env_target _env_iface _env_sync_volume
 
 if [ -z "$PEER" ]; then
 	echo "stereo: PEER is not set. Copy config.local.sh.example to config.local.sh" >&2
