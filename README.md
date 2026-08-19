@@ -10,6 +10,16 @@ machines but [doesn't do stereo pairs](https://rogueamoeba.com/support/manuals/a
 Loopback splits channels but only locally). As far as I can tell, nobody has
 shipped the combination on macOS.
 
+> **Vibe-coded.** This whole repo was built with Claude Code (Opus 5) — the
+> Swift, the shell, the Python and this README. I said what I wanted and it
+> wrote, ran and debugged the thing against my two MacBook Pros.
+>
+> The numbers here are real. Every latency and buffer figure was measured on
+> that hardware during the build, and where a measurement turned out to be wrong
+> it was re-taken and corrected rather than quietly kept. But treat this for
+> what it is: it works, it has been tested on exactly one pair of Macs, and
+> nobody else has reviewed it.
+
 ```bash
 open bin/StereoMenu.app     # menu bar toggles for stereo sync and volume sync
 ```
