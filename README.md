@@ -93,46 +93,58 @@ into a feedback howl, and `mutedWhenTapped` would silence it at the speakers.
 The output device is opened *before* the tap is created, because a process only
 becomes excludable once it has one.
 
-## Latency
-
-**~32 ms end to end**, measured: a 20 ms target, a 2.67 ms output buffer and
-roughly one capture period. That is below the ~45 ms at which audio lagging
-video becomes noticeable, so video stays watchable.
+## Latency and sync
 
 | | over Thunderbolt | over Wi-Fi |
 |---|---|---|
-| ping jitter | 0.06 ms stddev | 28.8 ms stddev |
-| target | **20 ms** | 150 ms, untuned |
+| ping jitter | 0.06 ms stddev | 28.8 ms stddev, 86 ms worst |
+| buffer | **20 ms** | **300 ms** |
+| end to end | **~32 ms** | ~310 ms |
+| channel offset | ~1 ms | ~1 ms |
 
-A direct Thunderbolt cable between the Macs is worth having: it cuts jitter
-~490× and is what makes 20 ms possible. It needs no setup — macOS brings up the
-bridge by itself — but it must be a real Thunderbolt/USB4 cable, not a charging
-cable.
+A direct Thunderbolt cable is what makes the low figure possible: it cuts jitter
+~490×. It needs no setup — macOS brings the bridge up by itself — but it must be
+a real Thunderbolt/USB4 cable, not a charging cable. At 32 ms video stays
+watchable; at 310 ms it does not, so over Wi-Fi this is for music.
+
+**Playback follows a schedule, not the buffer.** Each chunk carries the time it
+should be heard, in the sender's clock. The receiver works out the offset
+between the two machines' monotonic clocks by round-tripping readings and
+keeping the fastest exchange in a sliding window — the quickest round trip is
+the one least distorted by queueing, which is exactly what Wi-Fi does badly. It
+then slews towards that estimate at 200 µs per exchange rather than jumping,
+because a step in the offset moves the whole schedule and is audible.
+
+Holding a fixed buffer level instead, which is the obvious approach, does not
+survive Wi-Fi. Measured with both sides logging: the left channel sat at 149 ms
+while the right wandered between 164 and 236 ms, so the speakers were ~70 ms
+apart and moving — the stereo image slides around. With scheduling the same link
+holds ~1 ms.
+
+Buffer size is a separate matter from sync: it only decides whether the audio
+has arrived by the time its schedule comes due. At 150 ms over Wi-Fi the sync
+was right and the sound still broke up, which is why the wireless buffer is
+300 ms.
+
+Errors under 100 ms are corrected by playing fractionally faster or slower,
+bounded to 0.08% and inaudible. Past that it steps, with a cooldown: a reconnect
+or a machine waking leaves a gap that a 0.08% correction would take minutes to
+close, sounding wrong the whole way.
+
+The two machines' audio crystals differ — 8.3 ppm measured here — which the same
+mechanism absorbs. Before it existed, a receiver playing at exactly its own rate
+walked its buffer to empty and glitched about every 40 minutes.
 
 The link is chosen by trying the addresses the receiver advertises. A Mac
 publishes one per interface, and a direct Thunderbolt bridge self-assigns a
-`169.254.x` because nothing serves DHCP on it, so those are tried first.
-
-Two details that are easy to get wrong. Discovery has to resolve the advertised
-*hostname* rather than trust `NetService`'s own addresses, which only cover the
-interface the service happened to be found on — a browse that lands on Wi-Fi
-never sees the cable. And "starts with 169.254" does not identify the cable,
-because other interfaces carry link-local addresses too and will happily accept
-the connection; the sender checks `getsockname` after connecting and prefers the
-candidate that actually leaves through the bridge.
-
-**Clock drift is corrected by resampling.** The two machines' audio crystals
-differ — measured at **8.3 ppm** on this pair, over 2.7 hours of continuous
-audio — so a receiver playing at exactly its own rate walks its buffer to empty
-and glitches roughly every 40 minutes. Playback runs at a ratio a few ppm off
-1.0, adjusted by a slow loop on the buffer level, bounded to 0.08%: far below
-audible pitch change, and slow enough to track drift rather than chase jitter.
-Bursts are still discarded outright; the loop only handles slow drift.
-
-An earlier version used snapcast, at 350–500 ms of buffer and ~515 ms end to
-end. Its client could not schedule playback sooner than its own ~100 ms
-CoreAudio output queue, and that queue was a software choice: the hardware floor
-is 15 frames, 0.31 ms.
+`169.254.x` because nothing serves DHCP on it, so those are tried first. That
+prefix alone does not identify the cable, though: other interfaces carry
+link-local addresses too and will happily accept the connection, so the sender
+checks `getsockname` after connecting and prefers the one that actually leaves
+through the bridge. Discovery also resolves the advertised *hostname* rather
+than trusting `NetService`'s own addresses, which only cover the interface the
+service happened to be found on — a browse that lands on Wi-Fi never sees the
+cable.
 
 ## Two macOS permissions, both of which fail silently
 

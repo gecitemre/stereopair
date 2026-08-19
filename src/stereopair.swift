@@ -222,6 +222,15 @@ final class Ring: @unchecked Sendable {
 }
 
 /// Atomic is non-copyable, so a realtime callback cannot capture one directly.
+final class AtomicUInt64: @unchecked Sendable {
+    private let storage = Atomic<UInt64>(0)
+    init(_ value: UInt64) { storage.store(value, ordering: .releasing) }
+    var value: UInt64 {
+        get { storage.load(ordering: .acquiring) }
+        set { storage.store(newValue, ordering: .releasing) }
+    }
+}
+
 final class AtomicBool: @unchecked Sendable {
     private let storage = Atomic<Bool>(false)
     init(_ value: Bool) { storage.store(value, ordering: .releasing) }
@@ -281,6 +290,9 @@ final class Player {
     let schedule = Schedule()
     /// Sender clock minus ours. Zero when the sender is this machine.
     let clockOffset = AtomicInt(0)
+    /// How far playback is from where the schedule says it should be. This, not
+    /// the buffer level, is what tells you whether the two Macs agree.
+    let timingErrorMicros = AtomicInt(0)
     /// The sender picks this once it knows which link it got, so the receiver
     /// has to be able to change it after the fact.
     let target = AtomicInt(0)
@@ -309,6 +321,8 @@ final class Player {
 
         let schedule = self.schedule
         let offsetBox = self.clockOffset
+        let errorBox = self.timingErrorMicros
+        let lastSeek = AtomicUInt64(0)
         let status = AudioDeviceCreateIOProcIDWithBlock(&procID, device, nil) { _, _, _, outputData, outputTime in
             let buffers = UnsafeMutableAudioBufferListPointer(outputData)
             guard let first = buffers.first else { return }
@@ -338,14 +352,21 @@ final class Player {
                 // machine waking. Step to the right place rather than crawling
                 // there at 0.08%, which would take minutes and sound wrong the
                 // whole way.
-                if abs(drift) > sampleRate / 20 {
+                // Only for real discontinuities — a reconnect, a stall, a
+                // machine waking. Anything smaller is left to the rate loop,
+                // because a step is audible and a slew is not. The cooldown
+                // stops a wrong estimate turning into a stream of skips.
+                let now = nowNanos()
+                if abs(drift) > sampleRate / 10, now &- lastSeek.value > 2_000_000_000 {
                     ring.seek(to: wanted)
+                    lastSeek.value = now
                     timingError = 0
                 }
             }
 
             // Small errors are corrected by playing fractionally faster or
             // slower, which is inaudible, rather than by skipping samples.
+            errorBox.value = Int(timingError * 1_000_000)
             let correction = max(-0.0008, min(0.0008, timingError * 0.02))
             ratio += (1.0 + correction - ratio) * 0.05
 
@@ -565,33 +586,48 @@ func hostToNanos(_ hostTime: UInt64) -> UInt64 {
 /// queueing, which is the whole difficulty on Wi-Fi.
 final class ClockSync: @unchecked Sendable {
     private let lock = NSLock()
-    private var offset: Int64 = 0        // sender clock - our clock
-    private var bestRoundTrip: UInt64 = .max
-    private(set) var settled = false
+    private var window: [(roundTrip: UInt64, offset: Int64)] = []
+    private var applied: Int64 = 0
+    private var started = false
+
+    var settled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return started
+    }
 
     var offsetNanos: Int64 {
         lock.lock()
         defer { lock.unlock() }
-        return offset
+        return applied
     }
 
     func sample(sent: UInt64, remote: UInt64, received: UInt64) {
         let roundTrip = received &- sent
+        let midpoint = sent &+ roundTrip / 2
+        let offset = Int64(bitPattern: remote) - Int64(bitPattern: midpoint)
+
         lock.lock()
         defer { lock.unlock() }
-        // Decay the best estimate so a lucky early sample cannot pin it forever.
-        if roundTrip < bestRoundTrip || !settled {
-            bestRoundTrip = roundTrip
-            let midpoint = sent &+ roundTrip / 2
-            offset = Int64(bitPattern: remote) - Int64(bitPattern: midpoint)
-            settled = true
-        }
-    }
 
-    func relax() {
-        lock.lock()
-        bestRoundTrip = bestRoundTrip &+ bestRoundTrip / 8 &+ 1_000
-        lock.unlock()
+        // Judge each exchange only against recent ones. Keeping the best sample
+        // ever seen would pin the estimate to one lucky packet forever, and
+        // letting it decay lets a badly queued sample take over — on Wi-Fi the
+        // worst round trip is 86 ms, which is tens of milliseconds of error.
+        window.append((roundTrip, offset))
+        if window.count > 40 { window.removeFirst() }
+        guard let best = window.min(by: { $0.roundTrip < $1.roundTrip }) else { return }
+
+        if !started {
+            applied = best.offset
+            started = true
+            return
+        }
+        // Slew rather than jump: a step in the offset moves the whole schedule
+        // and shows up as a skip. 200 microseconds per exchange closes a
+        // realistic error within seconds and is far below audibility.
+        let limit: Int64 = 200_000
+        applied += max(-limit, min(limit, best.offset - applied))
     }
 }
 
@@ -1003,11 +1039,13 @@ func installTeardownHandlers() {
     atexit { teardown() }
 }
 
-func startStatsThread(_ label: String, _ ring: Ring) {
+func startStatsThread(_ label: String, _ player: Player) {
+    let ring = player.ring
     Thread {
         while true {
             Thread.sleep(forTimeInterval: 10)
             log("\(label) buffer \(ring.fill * 1000 / sampleRate) ms, "
+                + "offset \(player.timingErrorMicros.value / 1000) ms, "
                 + "underruns \(ring.underruns.load(ordering: .relaxed)), "
                 + "trimmed \(ring.trimmed.load(ordering: .relaxed))")
         }
@@ -1062,7 +1100,7 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
     let tap = Tap(left: player.ring, right: outbound)
     liveTap = tap
     log("ready" + (startIdle ? " (idle)" : ""))
-    startStatsThread("left", player.ring)
+    startStatsThread("left", player)
 
     let chunk = 256
     let chunkNanos = UInt64(chunk) * 1_000_000_000 / UInt64(sampleRate)
@@ -1114,7 +1152,10 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         disableNagle(fd)
 
         let wired = ourBridge != nil && localAddress(of: fd) == ourBridge
-        let negotiated = targetMs > 0 ? targetMs : (wired ? 20 : 150)
+        // Measured: at 150 ms over Wi-Fi the schedule regularly came due before the
+        // audio had arrived — sync was right but the sound broke up. The cable
+        // needs almost nothing; Wi-Fi delivers in bursts and needs real margin.
+        let negotiated = targetMs > 0 ? targetMs : (wired ? 20 : 300)
         log("connected to \(reached) over \(wired ? "thunderbolt" : "network"), "
             + "target \(negotiated) ms")
 
@@ -1150,9 +1191,8 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         // The local player follows the same schedule with a zero offset, so the
         // two channels line up by construction instead of by luck.
         var sent = 0
-        let start = nowNanos() &+ UInt64(negotiated) &* 1_000_000
+        var start: UInt64 = 0
         player.clockOffset.value = 0
-        player.schedule.set(position: player.ring.tailPosition, playTime: start)
 
         var deadline = DispatchTime.now().uptimeNanoseconds
 
@@ -1164,9 +1204,26 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         // *and* a chunk per capture is twice real time.
         while alive.value, senderActive.value {
             deadline &+= chunkNanos
+            let position = outbound.tailPosition
             let got = outbound.read(buffer, chunk)
             if got < chunk {
                 buffer.advanced(by: got).update(repeating: 0, count: chunk - got)
+            }
+            // Nothing captured yet: hold the schedule until the tap produces.
+            if sent == 0, got == 0 {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if deadline > now { usleep(useconds_t((deadline - now) / 1000)) }
+                continue
+            }
+            // Anchor on the first chunk that actually contains captured audio,
+            // not on the moment the session opened. The tap needs a moment to
+            // start producing, and anchoring before then leaves the schedule
+            // running ahead of any data — which reads as a permanent underrun.
+            if sent == 0 {
+                start = nowNanos() &+ UInt64(negotiated) &* 1_000_000
+                // Both rings are written by the same tap callback, so a
+                // position in one is the same instant in the other.
+                player.schedule.set(position: position, playTime: start)
             }
             let playTime = start &+ UInt64(sent) &* 1_000_000_000 / UInt64(sampleRate)
             var stamped = [UInt8]()
@@ -1198,7 +1255,7 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
     let targetFrames = targetMs * sampleRate / 1000
     let player = Player(targetFrames: targetFrames, ioFrames: ioFrames)
     livePlayer = player
-    startStatsThread("right", player.ring)
+    startStatsThread("right", player)
 
     let listener = socket(AF_INET, SOCK_STREAM, 0)
     var yes: Int32 = 1
@@ -1237,8 +1294,9 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
             // happens to be quick, and a machine that sleeps needs it redone.
             while !stop.value {
                 _ = sendUInt64s(client, .timeRequest, [nowNanos()], writeLock)
-                Thread.sleep(forTimeInterval: clock.settled ? 2 : 0.2)
-                clock.relax()
+                // Fast at first so playback can start, then often enough to
+                // keep the window fresh without flooding the link.
+                Thread.sleep(forTimeInterval: clock.settled ? 1 : 0.15)
             }
         }.start()
 

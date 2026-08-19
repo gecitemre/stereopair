@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PROFILE="${NOTARY_PROFILE:-stereopair}"
-VERSION="${VERSION:-1.0}"
+VERSION="${VERSION:-1.1}"
 APP="bin/StereoPair.app"
 DMG="bin/StereoPair-$VERSION.dmg"
 
