@@ -8,8 +8,44 @@ mkdir -p "$RUN"
 
 ./stereo-stop >/dev/null 2>&1 || true
 
-LOCAL_IP=$(ipconfig getifaddr "$IFACE")
-[ -n "$LOCAL_IP" ] || { echo "stereo: no address on $IFACE"; exit 1; }
+# Prefer a direct Thunderbolt cable when one is actually usable, otherwise fall
+# back to Wi-Fi. Both machines must have an address on the bridge and be able to
+# reach each other over it: bridge0 exists and stays UP with no cable attached,
+# so its presence alone proves nothing.
+resolve_link() {
+	if [ "$IFACE" != auto ]; then
+		LINK="$IFACE"
+		LOCAL_IP=$(ipconfig getifaddr "$IFACE" || true)
+		[ -n "$LOCAL_IP" ] || { echo "stereo: no address on $IFACE"; exit 1; }
+		return
+	fi
+
+	local bridge_ip peer_ip
+	bridge_ip=$(ipconfig getifaddr bridge0 2>/dev/null || true)
+	if [ -n "$bridge_ip" ]; then
+		peer_ip=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+			'ipconfig getifaddr bridge0' 2>/dev/null || true)
+		if [ -n "$peer_ip" ] && ping -c 1 -t 1 "$peer_ip" >/dev/null 2>&1; then
+			LINK="thunderbolt"
+			LOCAL_IP="$bridge_ip"
+			return
+		fi
+	fi
+
+	LINK="wi-fi"
+	LOCAL_IP=$(ipconfig getifaddr en0 || true)
+	[ -n "$LOCAL_IP" ] || { echo "stereo: no network on bridge0 or en0"; exit 1; }
+}
+
+resolve_link
+
+# A buffer tuned for the wired link starves clients over Wi-Fi, so it follows
+# the link unless you pinned it yourself.
+if [ "$BUFFER" = auto ]; then
+	if [ "$LINK" = thunderbolt ]; then BUFFER="$BUFFER_WIRED"; else BUFFER="$BUFFER_WIRELESS"; fi
+fi
+
+echo "stereo: $LINK link ($LOCAL_IP), buffer ${BUFFER}ms"
 
 wait_for_port() {
 	for _ in $(seq 1 50); do

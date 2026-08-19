@@ -1,6 +1,7 @@
 # Your machine-specific settings. Copy to config.local.sh and edit.
 PEER="you@other-mac.local"
 
-# Optional overrides:
-# BUFFER=500
-# IFACE=en0
+# Optional. Both default to "auto": a direct Thunderbolt cable is used when both
+# Macs can reach each other over it, otherwise Wi-Fi, and the buffer follows.
+# IFACE=bridge0
+# BUFFER=350

@@ -116,6 +116,12 @@ final class RingBuffer: @unchecked Sendable {
         }
     }
 
+    /// Frames captured but not yet written. This is latency on top of
+    /// snapcast's buffer, so it wants to stay near zero.
+    var backlog: Int {
+        head.load(ordering: .acquiring) - tail.load(ordering: .acquiring)
+    }
+
     func read(left: UnsafeMutablePointer<Int16>,
               right: UnsafeMutablePointer<Int16>,
               maxFrames: Int) -> Int
@@ -429,6 +435,7 @@ let drainThread = Thread {
     let left = UnsafeMutablePointer<Int16>.allocate(capacity: chunk)
     let right = UnsafeMutablePointer<Int16>.allocate(capacity: chunk)
     var reportedDrops = 0
+    var statsCountdown = 0
     while true {
         // Always emit a full chunk, padding with silence when the tap is idle.
         // If the stream is allowed to run dry the clients keep replaying their
@@ -456,6 +463,15 @@ let drainThread = Thread {
         if drops > reportedDrops + sampleRate / 10 {
             reportedDrops = drops
             FileHandle.standardError.write(Data("stereotap: dropped \(drops) frames (downstream too slow)\n".utf8))
+        }
+
+        // Backlog here is latency on top of snapcast's buffer, and it is the
+        // one part of the delay that can creep up without anything failing.
+        statsCountdown -= 1
+        if statsCountdown <= 0 {
+            statsCountdown = sampleRate * 5 / chunk
+            let backlogMs = ring.backlog * 1000 / sampleRate
+            FileHandle.standardError.write(Data("stereotap: backlog \(backlogMs) ms\n".utf8))
         }
     }
 }

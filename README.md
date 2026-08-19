@@ -81,15 +81,53 @@ Channel splitting happens on the server, not the client: snapclient has no
 per-client channel option, so the tap writes two separate mono streams and each
 Mac is assigned to one.
 
-**Buffer**: 500 ms, measured. 45 s of continuous audio at 500 ms gave zero
-underruns on either side. At 300 ms the remote client starved and exited:
+**Buffer**: the single number that decides both stability and how far behind
+the source you are. Measured on real hardware, checking *both* clients survive
+20–60 s of continuous audio:
+
+| link | ping jitter | tested stable | fails at |
+|---|---|---|---|
+| Wi-Fi | 28.8 ms stddev, 90 ms worst | 500 ms | 300 ms |
+| Thunderbolt bridge | 0.06 ms stddev, 0.43 ms worst | **350 ms** | 300 ms |
+
+A direct Thunderbolt cable between the two Macs cuts jitter ~490× and takes the
+buffer from 500 ms to 350 ms.
+
+Both `IFACE` and `BUFFER` default to `auto`: the cable is used when both Macs
+can actually reach each other over it, otherwise Wi-Fi, and the buffer follows
+the link — a value tuned for the cable starves clients over Wi-Fi. `bridge0`
+exists and stays UP with no cable attached, so detection checks that the peer
+has a bridge address and answers on it, not merely that the interface is there.
+`stereo-start` prints what it chose:
 
 ```
-Exception: Not enough frames available, requested frames: 4155, available: 1920
+stereo: thunderbolt link (169.254.115.177), buffer 350ms
+stereo: wi-fi link (192.168.1.24), buffer 500ms
 ```
 
-Treat that as the floor over Wi-Fi. Video will be out of lip-sync by roughly the
-buffer value, so this is for music.
+Pin `IFACE=bridge0` or `IFACE=en0` in `config.local.sh` to decide yourself. ssh
+can stay on Wi-Fi either way; only the audio stream follows `IFACE`.
+
+The gain is real but smaller than the jitter numbers suggest, because below
+~300 ms the limit stops being the network:
+
+```
+(Stream) outputBufferDacTime > bufferMs: 115 > 50
+```
+
+snapclient cannot schedule playback sooner than its own CoreAudio output buffer,
+about 115 ms, and it needs headroom above that to refill without starving. A
+faster link cannot fix that.
+
+**End-to-end delay** is the buffer plus the tap's backlog (~60 ms) plus the
+client's output queue (~100 ms): roughly **515 ms wired, 650 ms on Wi-Fi**.
+Audio lagging video is noticeable past ~45 ms and objectionable past ~125 ms, so
+**this is for music — video will never lip-sync**, on any link. Toggle stereo
+sync off in the menu bar to watch something.
+
+When testing buffer values, verify *both* clients survive. The local one dies of
+the same starvation as the remote one, and checking only the remote will tell
+you a setting works when it does not.
 
 Ignore `diff to server [ms]: 2.0e+09` in the client logs. snapcast times against
 a monotonic clock, so that figure is just the two machines' uptime difference,
