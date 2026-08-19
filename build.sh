@@ -41,7 +41,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - --identifier com.emre.stereopair "$APP"
+# A Developer ID signature is what lets the app open on someone else's Mac, and
+# notarization requires the hardened runtime. Fall back to ad-hoc so a plain
+# build still works without a certificate — it just will not travel.
+IDENTITY="${SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+	| grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/' || true)}"
 
-echo "built $APP"
-echo "open it here, and copy it to the other Mac (AirDrop is fine)"
+if [ -n "$IDENTITY" ]; then
+	codesign --force --timestamp --options runtime \
+		--sign "$IDENTITY" --identifier com.emre.stereopair "$APP"
+	echo "built $APP"
+	echo "signed with: $IDENTITY"
+else
+	codesign --force --sign - --identifier com.emre.stereopair "$APP"
+	echo "built $APP"
+	echo "ad-hoc signed: runs here, but will not open on another Mac."
+	echo "for that, create a Developer ID Application certificate and re-run."
+fi

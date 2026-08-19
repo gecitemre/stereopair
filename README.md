@@ -45,6 +45,32 @@ Needs the Xcode command line tools and nothing else: no Homebrew packages, no
 runtime dependencies. Copy the built app to the second Mac however you like;
 AirDrop is fine.
 
+`build.sh` signs with a **Developer ID Application** certificate if there is one
+in the keychain, and falls back to an ad-hoc signature otherwise. Ad-hoc is fine
+for your own machines but will not open on anyone else's.
+
+## Releasing
+
+```bash
+./release.sh        # signed, notarised, stapled DMG
+```
+
+Two one-time prerequisites:
+
+1. A **Developer ID Application** certificate: Xcode → Settings → Accounts →
+   your team → Manage Certificates → +. An *Apple Distribution* certificate is a
+   different thing and does not work outside the App Store.
+2. Notarisation credentials:
+   ```bash
+   xcrun notarytool store-credentials stereopair \
+     --apple-id you@example.com --team-id TEAMID --password APP_SPECIFIC_PASSWORD
+   ```
+   The password is an app-specific one from appleid.apple.com, not your Apple ID
+   password.
+
+The App Store is not an option: it requires the sandbox, and there is no
+entitlement that lets a sandboxed app create a Core Audio process tap.
+
 ## How it works
 
 ```
@@ -170,8 +196,8 @@ is actually capturing.
 ## Not done
 
 - The Wi-Fi target of 150 ms is a guess. Only the Thunderbolt path is measured.
-- Distribution needs a Developer ID and notarization; the ad-hoc signature here
-  only runs on machines that built it.
+- No notarised build has been produced yet, so nobody can install it without
+  building it.
 - Nobody but the author has installed it.
 
 ## Licence
