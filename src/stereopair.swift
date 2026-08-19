@@ -1,6 +1,7 @@
 // Two Macs as one stereo pair, without snapcast.
 //
-//   stereopair --send <host> [--port 4711] [--target-ms 20] [--io-frames 128]
+//   stereopair --send [host]  [--peer-name <name>]   (finds the receiver if omitted)
+//   stereopair --list [--target-ms 20] [--io-frames 128]
 //   stereopair --recv          [--port 4711] [--target-ms 20] [--io-frames 128]
 //
 // The sender taps system audio, plays the left channel through its own output
@@ -18,6 +19,7 @@ import AudioToolbox
 import CoreAudio
 import Darwin
 import Foundation
+import Network
 import Synchronization
 
 let sampleRate = 48000
@@ -364,6 +366,129 @@ final class Tap {
     }
 }
 
+// MARK: - Discovery
+
+let serviceType = "_stereopair._tcp."
+
+/// The receiver publishes itself so the sender never needs a hostname, an IP or
+/// ssh just to find it.
+final class Advertiser: NSObject, NetServiceDelegate {
+    private var service: NetService?
+
+    func start(port: UInt16) {
+        let name = Host.current().localizedName ?? "Mac"
+        let thread = Thread { [self] in
+            let published = NetService(domain: "local.", type: serviceType,
+                                       name: name, port: Int32(port))
+            published.delegate = self
+            published.publish()
+            service = published
+            RunLoop.current.run()
+        }
+        thread.name = "advertise"
+        thread.start()
+    }
+
+    func netServiceDidPublish(_ sender: NetService) {
+        log("advertising as \"\(sender.name)\"")
+    }
+
+    func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
+        log("could not advertise: \(errorDict)")
+    }
+}
+
+struct Peer {
+    let name: String
+    let addresses: [String]
+    let port: Int
+}
+
+func ipv4(_ data: Data) -> String? {
+    data.withUnsafeBytes { raw -> String? in
+        guard let base = raw.baseAddress,
+              raw.count >= MemoryLayout<sockaddr>.size,
+              base.assumingMemoryBound(to: sockaddr.self).pointee.sa_family == sa_family_t(AF_INET)
+        else { return nil }
+        var sin = base.assumingMemoryBound(to: sockaddr_in.self).pointee
+        var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &sin.sin_addr, &text, socklen_t(INET_ADDRSTRLEN))
+        return String(cString: text)
+    }
+}
+
+/// NetService hands back only the address for the interface it happened to be
+/// discovered on, but mDNS publishes one per interface. Resolving the advertised
+/// hostname instead returns all of them, which is the only way to see the
+/// Thunderbolt address when the service was found over Wi-Fi.
+func addresses(ofHost host: String) -> [String] {
+    var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM,
+                         ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil,
+                         ai_addr: nil, ai_next: nil)
+    var result: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo(host, nil, &hints, &result) == 0, let head = result else { return [] }
+    defer { freeaddrinfo(head) }
+
+    var found: [String] = []
+    var node: UnsafeMutablePointer<addrinfo>? = head
+    while let current = node {
+        if let raw = current.pointee.ai_addr {
+            var sin = raw.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            inet_ntop(AF_INET, &sin.sin_addr, &text, socklen_t(INET_ADDRSTRLEN))
+            let address = String(cString: text)
+            if address != "0.0.0.0" { found.append(address) }
+        }
+        node = current.pointee.ai_next
+    }
+    return found
+}
+
+final class Discovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
+    private let browser = NetServiceBrowser()
+    private var resolving: [NetService] = []
+
+    func search(timeout: TimeInterval) -> [Peer] {
+        browser.delegate = self
+        browser.searchForServices(ofType: serviceType, inDomain: "local.")
+        RunLoop.current.run(until: Date().addingTimeInterval(timeout))
+        browser.stop()
+
+        // Read the addresses at the end rather than in the resolve callback. A
+        // Mac on both Wi-Fi and a Thunderbolt bridge has an address per
+        // interface, they arrive separately, and the callback fires before they
+        // are all in — which loses exactly the link worth having.
+        return resolving.compactMap { service in
+            var found = (service.addresses ?? []).compactMap(ipv4)
+            if let host = service.hostName {
+                found += addresses(ofHost: host)
+            }
+            found = Array(Set(found))
+            guard !found.isEmpty else { return nil }
+            return Peer(name: service.name, addresses: found, port: service.port)
+        }
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService,
+                           moreComing: Bool)
+    {
+        service.delegate = self
+        resolving.append(service)      // must outlive the resolve
+        service.resolve(withTimeout: 3)
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {}
+}
+
+/// A direct Thunderbolt link self-assigns 169.254.x addresses because there is
+/// no DHCP on it, and that link is the one worth having: two orders of
+/// magnitude less jitter than Wi-Fi. So try those first and fall back.
+func preferredOrder(_ addresses: [String]) -> [String] {
+    addresses.sorted { a, b in
+        a.hasPrefix("169.254.") && !b.hasPrefix("169.254.")
+    }
+}
+
 // MARK: - Sockets
 
 func readAll(_ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ bytes: Int) -> Bool {
@@ -425,28 +550,70 @@ func startStatsThread(_ label: String, _ ring: Ring) {
 
 // MARK: - Modes
 
-func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
-    installTeardownHandlers()
-
+func connectTo(_ host: String, _ port: UInt16) -> Int32? {
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(AF_INET)
     addr.sin_port = port.bigEndian
-    guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else { die("bad host \(host)") }
+    guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else { return nil }
     let fd = socket(AF_INET, SOCK_STREAM, 0)
     let connected = withUnsafePointer(to: &addr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
             connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
-    guard connected == 0 else {
+    if connected == 0 { return fd }
+    log("  \(host): \(String(cString: strerror(errno)))")
+    close(fd)
+    return nil
+}
+
+func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
+               peerName: String?) -> Never
+{
+    installTeardownHandlers()
+
+    var candidates: [(String, UInt16)] = []
+    if host.isEmpty || host == "auto" {
+        log("looking for a receiver…")
+        let peers = Discovery().search(timeout: 4)
+        let chosen = peerName.map { wanted in peers.filter { $0.name == wanted } } ?? peers
+        guard let peer = chosen.first else {
+            die("""
+            found no receiver on the network.
+              Start StereoPair on the other Mac, or pass its address directly.
+              If nothing is ever found, allow this app under System Settings >
+              Privacy & Security > Local Network.
+            """)
+        }
+        if peers.count > 1 {
+            log("found \(peers.count) receivers, using \"\(peer.name)\"")
+        } else {
+            log("found \"\(peer.name)\"")
+        }
+        candidates = preferredOrder(peer.addresses).map { ($0, UInt16(peer.port)) }
+    } else {
+        candidates = [(host, port)]
+    }
+
+    var connection: Int32?
+    var reached = ""
+    for (address, candidatePort) in candidates {
+        if let fd = connectTo(address, candidatePort) {
+            connection = fd
+            reached = address
+            break
+        }
+    }
+    guard let fd = connection else {
         die("""
-        connect to \(host): \(String(cString: strerror(errno)))
-          "No route to host" here usually means macOS blocked the connection.
+        could not reach the receiver.
+          "No route to host" above usually means macOS blocked the connection.
           Allow this app under System Settings > Privacy & Security > Local Network.
         """)
     }
     disableNagle(fd)
-    log("connected to \(host):\(port)")
+    let link = reached.hasPrefix("169.254.") ? "thunderbolt" : "network"
+    log("connected to \(reached):\(port) over \(link)")
 
     let targetFrames = targetMs * sampleRate / 1000
 
@@ -515,6 +682,9 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
     listen(listener, 1)
     log("listening on \(port), target \(targetMs) ms")
 
+    let advertiser = Advertiser()
+    advertiser.start(port: port)
+
     let chunk = 256
     let buffer = UnsafeMutablePointer<Int16>.allocate(capacity: chunk)
     while true {
@@ -554,6 +724,18 @@ func runSelfTest(seconds: Double) -> Never {
     exit(0)
 }
 
+func runList() -> Never {
+    let peers = Discovery().search(timeout: 4)
+    // log(), not print(): launched via `open` there is nowhere for stdout to go.
+    if peers.isEmpty {
+        log("no receivers found")
+    }
+    for peer in peers {
+        log("\(peer.name)  \(preferredOrder(peer.addresses).joined(separator: " "))  port \(peer.port)")
+    }
+    exit(0)
+}
+
 // MARK: - Entry
 
 var mode = ""
@@ -561,6 +743,7 @@ var host = ""
 var port: UInt16 = 4711
 var targetMs = 20
 var ioFrames: UInt32 = 128
+var peerName: String?
 
 var args = Array(CommandLine.arguments.dropFirst())
 while let arg = args.first {
@@ -570,9 +753,15 @@ while let arg = args.first {
     case "--selftest": mode = "selftest"
     case "--send":
         mode = "send"
-        guard let value = args.first else { die("--send needs a host") }
-        args.removeFirst()
-        host = value
+        // Optional: with no address, or "auto", the receiver is found over Bonjour.
+        if let value = args.first, !value.hasPrefix("--") {
+            args.removeFirst()
+            host = value
+        }
+    case "--peer-name":
+        peerName = args.removeFirst()
+    case "--list":
+        mode = "list"
     case "--port": port = UInt16(args.removeFirst()) ?? 4711
     case "--target-ms": targetMs = Int(args.removeFirst()) ?? 20
     case "--io-frames": ioFrames = UInt32(args.removeFirst()) ?? 128
@@ -588,8 +777,9 @@ while let arg = args.first {
 signal(SIGPIPE, SIG_IGN)
 
 switch mode {
-case "send": runSender(host: host, port: port, targetMs: targetMs, ioFrames: ioFrames)
+case "send": runSender(host: host, port: port, targetMs: targetMs, ioFrames: ioFrames, peerName: peerName)
 case "recv": runReceiver(port: port, targetMs: targetMs, ioFrames: ioFrames)
 case "selftest": runSelfTest(seconds: 3)
-default: die("need --send <host> or --recv")
+case "list": runList()
+default: die("need --send [host], --recv, or --list")
 }

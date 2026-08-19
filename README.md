@@ -103,6 +103,21 @@ stereo is up over thunderbolt, 20ms target
 Pin `IFACE=bridge0` or `IFACE=en0` in `config.local.sh` to decide yourself. ssh
 can stay on Wi-Fi either way; only the audio follows `IFACE`.
 
+The receiver publishes itself over Bonjour as `_stereopair._tcp`, so the sender
+finds it without a hostname or an address:
+
+```bash
+./bin/StereoPair.app/Contents/MacOS/stereopair --list
+```
+
+That is also how the link gets chosen. A Mac advertises one address per
+interface, and a direct Thunderbolt bridge self-assigns a `169.254.x` one
+because nothing hands out DHCP on it, so those are tried first and the rest are
+the fallback. Discovery has to resolve the advertised *hostname* rather than
+trust what `NetService` returns: that only carries the address for the interface
+the service happened to be found on, which is the wrong one whenever the browse
+lands on Wi-Fi.
+
 **Clock drift is corrected by resampling.** The two machines' audio crystals
 differ — measured at **8.3 ppm** on this pair, over 2.7 hours of continuous
 audio — so a receiver playing at exactly its own rate walks its buffer to empty

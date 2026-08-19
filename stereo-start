@@ -64,7 +64,9 @@ sleep 2
 # to whichever app launches the process, so a bare binary gets silence.
 start_sender() {
 	rm -f "$RUN/stereopair.log"
-	open -n bin/StereoPair.app --args --send "$PEER_IP" \
+	# "auto": the receiver is found over Bonjour, and the address chosen from
+	# what it advertises — the Thunderbolt one when the cable is there.
+	open -n bin/StereoPair.app --args --send auto \
 		--target-ms "$TARGET_MS" --io-frames "$IO_FRAMES" --log "$RUN/stereopair.log"
 	# Poll rather than sleep a fixed amount: creating the tap can take several
 	# seconds, and a short fixed wait reports a working start as a failure.
