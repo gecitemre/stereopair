@@ -30,7 +30,27 @@ SIGN_ID="$IDENTITY" ./build.sh
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 rm -f "$DMG"
-hdiutil create -quiet -volname StereoPair -srcfolder "$APP" -ov -format UDZO "$DMG"
+# A bare disk image shows the app on its own with no hint of what to do with it.
+# create-dmg lays out the familiar window: the app on the left, an Applications
+# shortcut on the right, drag one onto the other.
+if command -v create-dmg >/dev/null; then
+	create-dmg \
+		--volname "StereoPair" \
+		--window-size 520 340 \
+		--icon-size 110 \
+		--icon "StereoPair.app" 130 150 \
+		--app-drop-link 390 150 \
+		--hide-extension "StereoPair.app" \
+		--no-internet-enable \
+		"$DMG" "$APP" >/dev/null
+else
+	echo "release: create-dmg not found (brew install create-dmg); falling back" >&2
+	STAGE=$(mktemp -d)
+	cp -R "$APP" "$STAGE/"
+	ln -s /Applications "$STAGE/Applications"
+	hdiutil create -quiet -volname StereoPair -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+	rm -rf "$STAGE"
+fi
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 echo "notarising, this usually takes a few minutes…"

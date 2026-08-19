@@ -12,6 +12,16 @@ mkdir -p "$APP/Contents/MacOS"
 swiftc -O -o "$APP/Contents/MacOS/stereopair" \
 	src/stereopair.swift src/menu.swift src/main.swift
 
+# The icon is generated rather than checked in, so it stays editable as code.
+mkdir -p "$APP/Contents/Resources"
+if [ ! -f build/StereoPair.icns ] || [ tools/make-icon.swift -nt build/StereoPair.icns ]; then
+	mkdir -p build
+	swiftc -O -o build/makeicon tools/make-icon.swift
+	./build/makeicon > /dev/null
+	iconutil -c icns build/StereoPair.iconset -o build/StereoPair.icns
+fi
+cp build/StereoPair.icns "$APP/Contents/Resources/StereoPair.icns"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -22,6 +32,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIdentifier</key>
 	<string>com.emre.stereopair</string>
 	<key>CFBundleName</key>
+	<string>StereoPair</string>
+	<key>CFBundleIconFile</key>
 	<string>StereoPair</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
