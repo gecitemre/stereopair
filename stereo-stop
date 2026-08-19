@@ -1,8 +1,0 @@
-#!/bin/bash
-# Only stops this Mac's sender. The receiver on the other Mac stays running and
-# idle, which is the point of it being a login item: nothing to start remotely.
-cd "$(dirname "$0")"
-
-pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair' 2>/dev/null
-rm -f "$PWD/run/stereopair.pid"
-echo "stereo stopped"

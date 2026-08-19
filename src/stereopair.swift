@@ -649,13 +649,14 @@ final class Discovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
         // Mac on both Wi-Fi and a Thunderbolt bridge has an address per
         // interface, they arrive separately, and the callback fires before they
         // are all in — which loses exactly the link worth having.
+        let ours = localAddresses()
         return resolving.compactMap { service in
             var found = (service.addresses ?? []).compactMap(ipv4)
             if let host = service.hostName {
                 found += addresses(ofHost: host)
             }
             found = Array(Set(found))
-            guard !found.isEmpty else { return nil }
+            guard !found.isEmpty, found.allSatisfy({ !ours.contains($0) }) else { return nil }
             return Peer(name: service.name, addresses: found, port: service.port)
         }
     }
@@ -678,6 +679,27 @@ func preferredOrder(_ addresses: [String]) -> [String] {
     addresses.sorted { a, b in
         a.hasPrefix("169.254.") && !b.hasPrefix("169.254.")
     }
+}
+
+/// Every address this Mac has, used to keep ourselves out of the peer list:
+/// we advertise too, so a browse always finds this machine as well.
+func localAddresses() -> Set<String> {
+    var found: Set<String> = ["127.0.0.1"]
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0, let head = list else { return found }
+    defer { freeifaddrs(head) }
+
+    var node: UnsafeMutablePointer<ifaddrs>? = head
+    while let current = node {
+        defer { node = current.pointee.ifa_next }
+        guard let raw = current.pointee.ifa_addr,
+              raw.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+        var sin = raw.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &sin.sin_addr, &text, socklen_t(INET_ADDRSTRLEN))
+        found.insert(String(cString: text))
+    }
+    return found
 }
 
 /// Our own address on the Thunderbolt bridge, if the cable is attached.
@@ -1003,54 +1025,4 @@ func runList() -> Never {
         log("\(peer.name)  \(preferredOrder(peer.addresses).joined(separator: " "))  port \(peer.port)")
     }
     exit(0)
-}
-
-// MARK: - Entry
-
-var mode = ""
-var host = ""
-var port: UInt16 = 4711
-var targetMs = 0   // 0 = decide from the link
-var ioFrames: UInt32 = 128
-var peerName: String?
-
-var args = Array(CommandLine.arguments.dropFirst())
-while let arg = args.first {
-    args.removeFirst()
-    switch arg {
-    case "--recv": mode = "recv"
-    case "--selftest": mode = "selftest"
-    case "--send":
-        mode = "send"
-        // Optional: with no address, or "auto", the receiver is found over Bonjour.
-        if let value = args.first, !value.hasPrefix("--") {
-            args.removeFirst()
-            host = value
-        }
-    case "--peer-name":
-        peerName = args.removeFirst()
-    case "--list":
-        mode = "list"
-    case "--port": port = UInt16(args.removeFirst()) ?? 4711
-    case "--target-ms":
-        let value = args.removeFirst()
-        targetMs = value == "auto" ? 0 : (Int(value) ?? 0)
-    case "--io-frames": ioFrames = UInt32(args.removeFirst()) ?? 128
-    case "--debug-tap":
-        tapLayoutReports = 3
-    case "--log":
-        // Launched via `open`, so stderr has nowhere to go.
-        freopen(args.removeFirst(), "a", stderr)
-    default: die("unknown argument \(arg)")
-    }
-}
-
-signal(SIGPIPE, SIG_IGN)
-
-switch mode {
-case "send": runSender(host: host, port: port, targetMs: targetMs, ioFrames: ioFrames, peerName: peerName)
-case "recv": runReceiver(port: port, targetMs: targetMs > 0 ? targetMs : 150, ioFrames: ioFrames)
-case "selftest": runSelfTest(seconds: 3)
-case "list": runList()
-default: die("need --send [host], --recv, or --list")
 }

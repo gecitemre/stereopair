@@ -1,25 +1,28 @@
 #!/bin/bash
-# Builds both app bundles. They have to be bundled and signed, not bare
-# binaries: the audio tap's permission and the local network permission are both
-# granted to the app that launches the process, and a bare binary gets silence
-# and "No route to host" with no error.
+# Builds StereoPair.app. It has to be a bundle and it has to be signed: both the
+# audio tap and the local network permission are granted to the app that
+# launches a process, and a bare binary silently gets neither.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-mkdir -p bin
+APP="bin/StereoPair.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS"
 
-plist() {
-	cat > "$1/Contents/Info.plist" <<PLIST
+swiftc -O -o "$APP/Contents/MacOS/stereopair" \
+	src/stereopair.swift src/menu.swift src/main.swift
+
+cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>$2</string>
+	<string>stereopair</string>
 	<key>CFBundleIdentifier</key>
-	<string>$3</string>
+	<string>com.emre.stereopair</string>
 	<key>CFBundleName</key>
-	<string>$4</string>
+	<string>StereoPair</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -30,32 +33,15 @@ plist() {
 	<string>14.4</string>
 	<key>LSUIElement</key>
 	<true/>
-$5
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>StereoPair captures the audio your apps are playing so it can split it across two Macs.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>StereoPair finds the other Mac and sends it the right channel.</string>
 </dict>
 </plist>
 PLIST
-}
 
-# --- StereoPair.app: tap, split, play one channel, ship the other ------------
-
-APP="bin/StereoPair.app"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-swiftc -O -o "$APP/Contents/MacOS/stereopair" src/stereopair.swift
-plist "$APP" stereopair com.emre.stereopair StereoPair '	<key>NSAudioCaptureUsageDescription</key>
-	<string>StereoPair captures the audio your apps are playing so it can split it across two Macs.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>StereoPair sends the right channel to the second Mac.</string>'
 codesign --force --sign - --identifier com.emre.stereopair "$APP"
 
-# --- StereoMenu.app: the menu bar toggles ------------------------------------
-
-MENU="bin/StereoMenu.app"
-rm -rf "$MENU"
-mkdir -p "$MENU/Contents/MacOS"
-swiftc -O -o "$MENU/Contents/MacOS/StereoMenu" src/StereoMenu.swift
-plist "$MENU" StereoMenu com.emre.stereomenu StereoMenu ''
-codesign --force --sign - --identifier com.emre.stereomenu "$MENU"
-
-echo "built $APP and $MENU"
-echo "menu bar app: open $MENU"
+echo "built $APP"
+echo "open it here, and copy it to the other Mac (AirDrop is fine)"
