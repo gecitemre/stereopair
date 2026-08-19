@@ -5,8 +5,8 @@ let projectRoot = Bundle.main.bundleURL
     .deletingLastPathComponent()
     .deletingLastPathComponent()
 
-/// GUI apps do not inherit a shell PATH, so snapserver, snapclient and python3
-/// would all be missing without this.
+/// GUI apps do not inherit a shell PATH, so python3 and the rest would be
+/// missing without this.
 let searchPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 @MainActor
@@ -37,10 +37,6 @@ final class Controller: NSObject, NSMenuDelegate {
         check.target = self
         menu.addItem(check)
 
-        let ui = NSMenuItem(title: "Open Control UI", action: #selector(openControlUI), keyEquivalent: "")
-        ui.target = self
-        menu.addItem(ui)
-
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
@@ -59,7 +55,7 @@ final class Controller: NSObject, NSMenuDelegate {
         return kill(pid, 0) == 0
     }
 
-    private var stereoOn: Bool { isRunning("snapserver.pid") }
+    private var stereoOn: Bool { isRunning("stereopair.pid") }
     private var volumeOn: Bool { isRunning("volume.pid") }
 
     private func refresh() {
@@ -94,7 +90,7 @@ final class Controller: NSObject, NSMenuDelegate {
 
     // MARK: - Running scripts
 
-    /// Scripts take seconds (ssh, waiting for clients), so never block the menu.
+    /// Scripts take seconds (ssh, starting the far end), so never block the menu.
     private func run(_ script: String, _ arguments: [String] = [],
                      environment extra: [String: String] = [:],
                      then completion: (() -> Void)? = nil)
@@ -153,9 +149,6 @@ final class Controller: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func openControlUI() {
-        NSWorkspace.shared.open(URL(string: "http://localhost:1780")!)
-    }
 }
 
 let app = NSApplication.shared

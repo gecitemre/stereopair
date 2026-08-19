@@ -1,40 +1,16 @@
 #!/usr/bin/env python3
-"""Set both Macs to the same level.
+"""Keep both Macs at the same level.
 
-Loudness runs through snapcast's software mixer on both machines, so the two
-sides share one gain curve and match by construction. That only holds while the
-two system volumes agree, so this warns when they have drifted apart.
-
-A trim is a persistent per-side offset in points, for when one machine is
-genuinely louder than the other.
+Both machines run the same OS on the same hardware, so the same slider value is
+the same gain and no curve mapping is involved. Volume is the system volume on
+each machine; there is no software mixer in the audio path.
 """
 
-import json
 import os
 import subprocess
 import sys
 import threading
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from snapctl import LEFT, RIGHT, Control, client_of  # noqa: E402
-
-TRIM_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "run", "trim.json")
-
-
-def load_trims():
-    try:
-        with open(TRIM_FILE) as handle:
-            return json.load(handle)
-    except FileNotFoundError:
-        return {"left": 0, "right": 0}
-
-
-def save_trims(trims):
-    with open(TRIM_FILE, "w") as handle:
-        json.dump(trims, handle)
-
 
 def system_volume_local():
     out = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"],
@@ -153,15 +129,6 @@ def watch():
             continue
         quiet_until = time.time() + settle
 
-
-def set_volume(control, status, client_id, percent):
-    client = client_of(status, client_id)
-    if client is None:
-        sys.exit(f"volume: {client_id} is not connected")
-    control.call("Client.SetVolume",
-                 {"id": client_id, "volume": {"muted": False, "percent": percent}})
-
-
 def main():
     args = sys.argv[1:]
 
@@ -174,34 +141,10 @@ def main():
         print(f"  peer system volume set to {level}%")
         return
 
-    trims = load_trims()
-
-    for flag, key in (("--trim-left", "left"), ("--trim-right", "right")):
-        if flag in args:
-            index = args.index(flag)
-            trims[key] = int(args[index + 1])
-            del args[index:index + 2]
-    save_trims(trims)
-
-    control = Control()
-    status = control.status()
-
     if args:
         level = max(0, min(100, int(args[0])))
-        for client_id, key in ((LEFT, "left"), (RIGHT, "right")):
-            set_volume(control, status, client_id,
-                       max(0, min(100, level + trims[key])))
-        status = control.status()
-
-    left, right = client_of(status, LEFT), client_of(status, RIGHT)
-    for name, client in (("left ", left), ("right", right)):
-        if client:
-            volume = client["config"]["volume"]
-            state = "" if client["connected"] else "  (DISCONNECTED)"
-            print(f"  {name}  snapcast {volume['percent']:3}%  muted={volume['muted']}{state}")
-
-    if trims["left"] or trims["right"]:
-        print(f"  trims  left {trims['left']:+d}  right {trims['right']:+d}")
+        set_system_volume_local(level)
+        set_system_volume_peer(level)
 
     local, peer = system_volume_local(), system_volume_peer()
     print(f"  system volume  this Mac {local}%  peer {peer}%")

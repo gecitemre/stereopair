@@ -17,93 +17,86 @@ resolve_link() {
 		LINK="$IFACE"
 		LOCAL_IP=$(ipconfig getifaddr "$IFACE" || true)
 		[ -n "$LOCAL_IP" ] || { echo "stereo: no address on $IFACE"; exit 1; }
+		PEER_IP=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+			"ipconfig getifaddr $IFACE" 2>/dev/null || true)
+		[ -n "$PEER_IP" ] || { echo "stereo: peer has no address on $IFACE"; exit 1; }
 		return
 	fi
 
-	local bridge_ip peer_ip
+	local bridge_ip peer_bridge
 	bridge_ip=$(ipconfig getifaddr bridge0 2>/dev/null || true)
 	if [ -n "$bridge_ip" ]; then
-		peer_ip=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+		peer_bridge=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
 			'ipconfig getifaddr bridge0' 2>/dev/null || true)
-		if [ -n "$peer_ip" ] && ping -c 1 -t 1 "$peer_ip" >/dev/null 2>&1; then
+		if [ -n "$peer_bridge" ] && ping -c 1 -t 1 "$peer_bridge" >/dev/null 2>&1; then
 			LINK="thunderbolt"
 			LOCAL_IP="$bridge_ip"
+			PEER_IP="$peer_bridge"
 			return
 		fi
 	fi
 
 	LINK="wi-fi"
 	LOCAL_IP=$(ipconfig getifaddr en0 || true)
-	[ -n "$LOCAL_IP" ] || { echo "stereo: no network on bridge0 or en0"; exit 1; }
+	PEER_IP=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
+		'ipconfig getifaddr en0' 2>/dev/null || true)
+	[ -n "$PEER_IP" ] || { echo "stereo: cannot reach the second Mac"; exit 1; }
 }
 
 resolve_link
 
-# A buffer tuned for the wired link starves clients over Wi-Fi, so it follows
-# the link unless you pinned it yourself.
-if [ "$BUFFER" = auto ]; then
-	if [ "$LINK" = thunderbolt ]; then BUFFER="$BUFFER_WIRED"; else BUFFER="$BUFFER_WIRELESS"; fi
+# A target tuned for the cable cannot hold over Wi-Fi, so it follows the link
+# unless you pinned it yourself.
+if [ "$TARGET_MS" = auto ]; then
+	if [ "$LINK" = thunderbolt ]; then TARGET_MS="$TARGET_WIRED"; else TARGET_MS="$TARGET_WIRELESS"; fi
 fi
 
-echo "stereo: $LINK link ($LOCAL_IP), buffer ${BUFFER}ms"
+# Receiver first: the sender exits if nothing is listening.
+ssh -o BatchMode=yes "$PEER" \
+	"pkill -f 'StereoPair[.]app'; sleep 1; \
+	 rm -f ~/stereopair/recv.log; \
+	 open -n ~/stereopair/StereoPair.app --args --recv \
+	   --target-ms $TARGET_MS --io-frames $IO_FRAMES --log \$HOME/stereopair/recv.log"
 
-wait_for_port() {
-	for _ in $(seq 1 50); do
-		nc -z 127.0.0.1 "$1" 2>/dev/null && return 0
-		sleep 0.2
-	done
-	echo "stereo: port $1 never opened, see $RUN/snapserver.log"
-	exit 1
+sleep 2
+
+# `open` rather than the binary directly: the audio tap's permission is granted
+# to whichever app launches the process, so a bare binary gets silence.
+start_sender() {
+	rm -f "$RUN/stereopair.log"
+	open -n bin/StereoPair.app --args --send "$PEER_IP" \
+		--target-ms "$TARGET_MS" --io-frames "$IO_FRAMES" --log "$RUN/stereopair.log"
+	sleep 2
+	grep -q "tapping" "$RUN/stereopair.log" 2>/dev/null
 }
 
-cat > "$RUN/snapserver.conf" <<EOF
-[server]
-datadir = $RUN
+# Rebuilding changes the ad-hoc signature, which macOS treats as a new identity:
+# the first connection after a build is refused while it re-registers, and the
+# next one succeeds. Retry once rather than making that the user's problem.
+if ! start_sender; then
+	if grep -q "No route to host" "$RUN/stereopair.log" 2>/dev/null; then
+		pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair' 2>/dev/null
+		sleep 1
+		start_sender || true
+	fi
+fi
 
-[stream]
-source = pipe://$RUN/left?name=left&sampleformat=48000:16:1&codec=pcm
-source = pipe://$RUN/right?name=right&sampleformat=48000:16:1&codec=pcm
-sampleformat = 48000:16:1
-codec = pcm
-chunk_ms = 20
-buffer = $BUFFER
-EOF
+if ! grep -q "tapping" "$RUN/stereopair.log" 2>/dev/null; then
+	echo "stereo: sender did not start —"
+	sed 's/^/  /' "$RUN/stereopair.log" 2>/dev/null
+	exit 1
+fi
 
-snapserver -c "$RUN/snapserver.conf" > "$RUN/snapserver.log" 2>&1 &
-echo $! > "$RUN/snapserver.pid"
-wait_for_port 1705
+# `open` does not report the pid it launched, and the menu bar app needs
+# something to test.
+pgrep -f 'StereoPair[.]app/Contents/MacOS/stereopair' > "$RUN/stereopair.pid"
 
-# Redirect stdout/stderr to a file, not just --logsink: a background child that
-# inherits the terminal keeps the calling shell's pipe open and the script
-# appears to hang after it has already finished.
-snapclient --hostID stereo-left --logsink "file:$RUN/snapclient.log" \
-	tcp://127.0.0.1:1704 > /dev/null 2>&1 &
-echo $! > "$RUN/snapclient.pid"
-
-# Launch through `open` so the client runs as a bundled app with its own
-# identity; a bare binary's LAN connections are dropped by Local Network policy.
-# The bracket in the kill pattern stops pkill matching this command line itself.
-ssh -o BatchMode=yes "$PEER" \
-	"pkill -f 'SnapRight[.]app/Contents/MacOS/snapclient' 2>/dev/null; \
-	 open -n ~/stereo-right/SnapRight.app --args --hostID stereo-right \
-	   --logsink file:\$HOME/stereo-right/snapclient.log tcp://$LOCAL_IP:1704"
-
-python3 bin/assign.py
-
-# Keep the second Mac's volume glued to this one's, so the hardware volume keys
-# move both speakers together instead of tilting the stereo image.
 if [ "$SYNC_VOLUME" = 1 ]; then
 	./stereo-volume-sync start
 fi
 
-# Must come last: the tap excludes the local snapclient so its playback is not
-# captured back into the stream, and `open` gives the app its own TCC identity
-# (a tap inherited from a parent process is silently denied).
-open -n bin/StereoTap.app --args \
-	--exclude-pid "$(cat "$RUN/snapclient.pid")" \
-	--left "$RUN/left" --right "$RUN/right" --log "$RUN/stereotap.log"
-
 echo
-echo "stereo is up. left = this Mac, right = $PEER"
-echo "  control ui   http://localhost:1780"
+echo "stereo is up over $LINK, ${TARGET_MS}ms target"
+echo "  left  = this Mac"
+echo "  right = $PEER"
 echo "  stop with    ./stereo-stop"
