@@ -1,7 +1,6 @@
-# Your machine-specific settings. Copy to config.local.sh and edit.
+# Only needed for ./deploy-peer.sh, which installs the receiver on the other Mac.
 PEER="you@other-mac.local"
 
-# Optional. Both default to "auto": a direct Thunderbolt cable is used when both
-# Macs can reach each other over it, otherwise Wi-Fi, and the buffer follows.
-# IFACE=bridge0
-# BUFFER=350
+# Optional overrides:
+# TARGET_MS=20      # force a buffer instead of letting the link decide
+# IO_FRAMES=128

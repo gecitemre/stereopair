@@ -29,22 +29,27 @@ or from the terminal:
 - Two Macs, both macOS 14.4+ (the audio tap API is new).
 - Xcode command line tools, for `swiftc` and `codesign`. Nothing else: no
   Homebrew packages, no runtime dependencies.
-- SSH from the first Mac to the second (Remote Login + a key).
+- SSH to the second Mac **once**, to install it. After that the receiver starts
+  at login and is found over Bonjour, so running the rig needs neither ssh nor
+  an address.
 - A Thunderbolt cable between them is optional but worth it — see Latency.
 
 ## Setup
 
 ```bash
-# On the second Mac: System Settings > General > Sharing > Remote Login.
-ssh-copy-id you@other-mac.local          # once, asks for that Mac's password
+# On the second Mac, once: System Settings > General > Sharing > Remote Login.
+ssh-copy-id you@other-mac.local          # asks for that Mac's password
 
 cp config.local.sh.example config.local.sh
 $EDITOR config.local.sh                  # set PEER=you@other-mac.local
 
 ./build.sh          # builds StereoPair.app and StereoMenu.app
-./deploy-peer.sh    # copies the same app to the second Mac
+./deploy-peer.sh    # installs it on the second Mac as a login item
 open bin/StereoMenu.app
 ```
+
+`PEER` and ssh are only for that install step. From then on `./stereo-start`
+finds the other Mac by itself, and you can turn Remote Login back off.
 
 Then grant two permissions, both of which are described below. `./stereo-doctor`
 checks every prerequisite and tells you exactly which one is missing.
@@ -68,9 +73,17 @@ StereoPair.app ──┬── left  channel ─→ this Mac's speakers
                  └── right channel ─→ tcp ─→ StereoPair.app ─→ second Mac
 ```
 
-One process on each machine, talking raw PCM over TCP. Both sides hold the same
-target buffer before playing, so they stay aligned: the network adds well under
-a millisecond over a cable, which is nothing next to the target.
+One process per machine. The receiver runs at login, advertises itself over
+Bonjour as `_stereopair._tcp`, and waits. The sender finds it, connects, decides
+the target from the link it got, and tells the receiver to hold it.
+
+One connection carries everything — audio, volume and the target — as framed
+messages, `[type][length][payload]`. That is why volume mirrors both ways with
+no shell on the other machine: change it on either Mac and the other follows.
+
+```bash
+./bin/StereoPair.app/Contents/MacOS/stereopair --list   # what is out there
+```
 
 The tap excludes this process. That matters twice — our own left-channel
 playback would otherwise be captured straight back into the stream and build
@@ -87,36 +100,19 @@ video becomes noticeable, so video stays watchable.
 | | over Thunderbolt | over Wi-Fi |
 |---|---|---|
 | ping jitter | 0.06 ms stddev | 28.8 ms stddev |
-| usable target | **20 ms** | 150 ms+, untuned |
+| target | **20 ms** | 150 ms, untuned |
 
-`IFACE` and `TARGET_MS` both default to `auto`: a direct Thunderbolt cable is
-used when both Macs can actually reach each other over it, otherwise Wi-Fi, and
-the target follows the link — 20 ms cannot survive Wi-Fi, whose jitter alone is
-larger than the whole buffer. `bridge0` exists and stays UP with no cable
-attached, so detection checks that the peer answers on it, not merely that the
-interface exists. `stereo-start` prints what it chose:
+The link is chosen by trying the addresses the receiver advertises. A Mac
+publishes one per interface, and a direct Thunderbolt bridge self-assigns a
+`169.254.x` because nothing serves DHCP on it, so those are tried first.
 
-```
-stereo is up over thunderbolt, 20ms target
-```
-
-Pin `IFACE=bridge0` or `IFACE=en0` in `config.local.sh` to decide yourself. ssh
-can stay on Wi-Fi either way; only the audio follows `IFACE`.
-
-The receiver publishes itself over Bonjour as `_stereopair._tcp`, so the sender
-finds it without a hostname or an address:
-
-```bash
-./bin/StereoPair.app/Contents/MacOS/stereopair --list
-```
-
-That is also how the link gets chosen. A Mac advertises one address per
-interface, and a direct Thunderbolt bridge self-assigns a `169.254.x` one
-because nothing hands out DHCP on it, so those are tried first and the rest are
-the fallback. Discovery has to resolve the advertised *hostname* rather than
-trust what `NetService` returns: that only carries the address for the interface
-the service happened to be found on, which is the wrong one whenever the browse
-lands on Wi-Fi.
+Two details that are easy to get wrong. Discovery has to resolve the advertised
+*hostname* rather than trust `NetService`'s own addresses, which only cover the
+interface the service happened to be found on — a browse that lands on Wi-Fi
+never sees the cable. And "starts with 169.254" is not enough to identify the
+cable, because other interfaces have link-local addresses too and will happily
+accept the connection; the sender checks `getsockname` after connecting and
+prefers the candidate that actually leaves through the bridge.
 
 **Clock drift is corrected by resampling.** The two machines' audio crystals
 differ — measured at **8.3 ppm** on this pair, over 2.7 hours of continuous
@@ -126,10 +122,10 @@ ppm off 1.0, adjusted by a slow loop on the buffer level, bounded to 0.08%: far
 below audible pitch change, and slow enough to track drift rather than chase
 jitter. Bursts are still discarded outright; the loop only handles slow drift.
 
-An earlier version of this used snapcast, which does handle drift, at 350–500 ms
-of buffer and ~515 ms end to end. Its client could not schedule playback sooner
-than its own ~100 ms CoreAudio output queue, and that queue was a software
-choice: the hardware floor is 15 frames, 0.31 ms.
+An earlier version used snapcast, at 350–500 ms of buffer and ~515 ms end to
+end. Its client could not schedule playback sooner than its own ~100 ms
+CoreAudio output queue, and that queue was a software choice: the hardware floor
+is 15 frames, 0.31 ms.
 
 ## Two macOS permissions, both of which fail silently
 
@@ -167,21 +163,10 @@ list, it hasn't requested access yet — start it, then reopen Settings.
 
 ## Volume
 
-`stereo-start` runs a watcher that keeps both machines at the same level,
-whichever one you change. Same OS and same hardware means the same slider value
-is the same gain, so no curve mapping is involved and there is no software mixer
-in the audio path.
-
-```bash
-./stereo-volume        # show both, warn if they have drifted apart
-./stereo-volume 60     # set both
-```
-
-The watcher levels the two to the *quieter* of them when it starts, so enabling
-it never raises a machine unexpectedly.
-
-Stereo sync and volume sync are independent — the menu bar app toggles each on
-its own, and `SYNC_VOLUME=0 ./stereo-start` skips the watcher from the terminal.
+Volume mirrors both ways while connected: change it on either Mac and the other
+follows, over the same connection as the audio. Both machines run the same OS on
+the same hardware, so the same slider value is the same gain and nothing needs
+mapping between volume curves. There is no software mixer in the audio path.
 
 ## Placement
 
@@ -198,13 +183,11 @@ off to one side is worse than either.
 |---|---|
 | `src/stereopair.swift` | Everything: tap, split, playback, transport |
 | `build.sh` | Builds and signs both app bundles |
-| `deploy-peer.sh` | Copies the app to the second Mac |
+| `deploy-peer.sh` | Installs the app on the second Mac as a login item |
 | `stereo-start` / `stereo-stop` | Bring the rig up and down |
 | `src/StereoMenu.swift` | Menu bar app: toggles for stereo sync and volume sync |
-| `stereo-volume-sync` | `start` / `stop` / `status` the volume watcher on its own |
 | `stereo-doctor` | Checks prerequisites and both silent-failure permissions |
-| `stereo-volume` | Show/set both levels, per-side trims |
-| `config.sh` | Buffer, interface; reads `config.local.sh` for your peer |
+| `config.sh` | Target and IO buffer; `PEER` for the one-time install |
 
 Nothing is installed on the second Mac and it needs no admin password.
 

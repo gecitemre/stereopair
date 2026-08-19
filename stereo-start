@@ -1,4 +1,7 @@
 #!/bin/bash
+# No ssh, no addresses, no link detection: the receiver runs at login on the
+# other Mac and advertises itself, and the sender finds it, picks the best of
+# the addresses it advertises, and tells it what target to hold.
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./config.sh
@@ -6,71 +9,20 @@ source ./config.sh
 RUN="$PWD/run"
 mkdir -p "$RUN"
 
-./stereo-stop >/dev/null 2>&1 || true
+pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair' 2>/dev/null || true
+sleep 1
 
-# Prefer a direct Thunderbolt cable when one is actually usable, otherwise fall
-# back to Wi-Fi. Both machines must have an address on the bridge and be able to
-# reach each other over it: bridge0 exists and stays UP with no cable attached,
-# so its presence alone proves nothing.
-resolve_link() {
-	if [ "$IFACE" != auto ]; then
-		LINK="$IFACE"
-		LOCAL_IP=$(ipconfig getifaddr "$IFACE" || true)
-		[ -n "$LOCAL_IP" ] || { echo "stereo: no address on $IFACE"; exit 1; }
-		PEER_IP=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
-			"ipconfig getifaddr $IFACE" 2>/dev/null || true)
-		[ -n "$PEER_IP" ] || { echo "stereo: peer has no address on $IFACE"; exit 1; }
-		return
-	fi
-
-	local bridge_ip peer_bridge
-	bridge_ip=$(ipconfig getifaddr bridge0 2>/dev/null || true)
-	if [ -n "$bridge_ip" ]; then
-		peer_bridge=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
-			'ipconfig getifaddr bridge0' 2>/dev/null || true)
-		if [ -n "$peer_bridge" ] && ping -c 1 -t 1 "$peer_bridge" >/dev/null 2>&1; then
-			LINK="thunderbolt"
-			LOCAL_IP="$bridge_ip"
-			PEER_IP="$peer_bridge"
-			return
-		fi
-	fi
-
-	LINK="wi-fi"
-	LOCAL_IP=$(ipconfig getifaddr en0 || true)
-	PEER_IP=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
-		'ipconfig getifaddr en0' 2>/dev/null || true)
-	[ -n "$PEER_IP" ] || { echo "stereo: cannot reach the second Mac"; exit 1; }
-}
-
-resolve_link
-
-# A target tuned for the cable cannot hold over Wi-Fi, so it follows the link
-# unless you pinned it yourself.
-if [ "$TARGET_MS" = auto ]; then
-	if [ "$LINK" = thunderbolt ]; then TARGET_MS="$TARGET_WIRED"; else TARGET_MS="$TARGET_WIRELESS"; fi
-fi
-
-# Receiver first: the sender exits if nothing is listening.
-ssh -o BatchMode=yes "$PEER" \
-	"pkill -f 'StereoPair[.]app'; sleep 1; \
-	 rm -f ~/stereopair/recv.log; \
-	 open -n ~/stereopair/StereoPair.app --args --recv \
-	   --target-ms $TARGET_MS --io-frames $IO_FRAMES --log \$HOME/stereopair/recv.log"
-
-sleep 2
-
-# `open` rather than the binary directly: the audio tap's permission is granted
-# to whichever app launches the process, so a bare binary gets silence.
 start_sender() {
 	rm -f "$RUN/stereopair.log"
-	# "auto": the receiver is found over Bonjour, and the address chosen from
-	# what it advertises — the Thunderbolt one when the cable is there.
+	# `open` rather than the binary directly: the audio tap's permission is
+	# granted to whichever app launches the process, so a bare binary gets
+	# silence with no error.
 	open -n bin/StereoPair.app --args --send auto \
 		--target-ms "$TARGET_MS" --io-frames "$IO_FRAMES" --log "$RUN/stereopair.log"
-	# Poll rather than sleep a fixed amount: creating the tap can take several
-	# seconds, and a short fixed wait reports a working start as a failure.
-	for _ in $(seq 1 20); do
+	# Poll rather than sleep a fixed amount: finding the receiver and creating
+	# the tap take a few seconds, and a short fixed wait reports a working start
+	# as a failure.
+	for _ in $(seq 1 30); do
 		grep -q "tapping" "$RUN/stereopair.log" 2>/dev/null && return 0
 		grep -q "No route to host" "$RUN/stereopair.log" 2>/dev/null && return 1
 		sleep 0.5
@@ -90,8 +42,9 @@ if ! start_sender; then
 fi
 
 if ! grep -q "tapping" "$RUN/stereopair.log" 2>/dev/null; then
-	echo "stereo: sender did not start —"
+	echo "stereo: could not start —"
 	sed 's/^/  /' "$RUN/stereopair.log" 2>/dev/null
+	echo "  is StereoPair running on the other Mac? ./deploy-peer.sh installs it."
 	exit 1
 fi
 
@@ -99,12 +52,7 @@ fi
 # something to test.
 pgrep -f 'StereoPair[.]app/Contents/MacOS/stereopair' > "$RUN/stereopair.pid"
 
-if [ "$SYNC_VOLUME" = 1 ]; then
-	./stereo-volume-sync start
-fi
-
 echo
-echo "stereo is up over $LINK, ${TARGET_MS}ms target"
-echo "  left  = this Mac"
-echo "  right = $PEER"
+grep -a "connected to" "$RUN/stereopair.log" | sed 's/stereopair: /stereo is up: /'
+echo "  left  = this Mac, right = the Mac it found"
 echo "  stop with    ./stereo-stop"

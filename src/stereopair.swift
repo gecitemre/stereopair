@@ -81,6 +81,47 @@ func processObject(for pid: pid_t) -> AudioObjectID {
     return out
 }
 
+// MARK: - System volume
+
+/// Read and write the output slider directly. Both machines run the same OS on
+/// the same hardware, so the same scalar is the same loudness and no mapping
+/// between volume curves is needed.
+func systemVolume() -> Float? {
+    let device = defaultOutputDevice()
+    guard device != kAudioObjectUnknown else { return nil }
+    for element: AudioObjectPropertyElement in [kAudioObjectPropertyElementMain, 1] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element)
+        guard AudioObjectHasProperty(device, &addr) else { continue }
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        if AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &value) == noErr {
+            return value
+        }
+    }
+    return nil
+}
+
+func setSystemVolume(_ level: Float) {
+    let device = defaultOutputDevice()
+    guard device != kAudioObjectUnknown else { return }
+    var value = Float32(max(0, min(1, level)))
+    for element: AudioObjectPropertyElement in [kAudioObjectPropertyElementMain, 1, 2] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element)
+        guard AudioObjectHasProperty(device, &addr) else { continue }
+        var settable: DarwinBoolean = false
+        guard AudioObjectIsPropertySettable(device, &addr, &settable) == noErr, settable.boolValue
+        else { continue }
+        AudioObjectSetPropertyData(device, &addr, 0, nil,
+                                   UInt32(MemoryLayout<Float32>.size), &value)
+    }
+}
+
 // MARK: - Ring buffer
 
 final class Ring: @unchecked Sendable {
@@ -111,6 +152,12 @@ final class Ring: @unchecked Sendable {
 
     /// Without pulling the level back, any startup burst or accumulated drift
     /// becomes permanent latency.
+    func clear() {
+        tail.store(head.load(ordering: .acquiring), ordering: .releasing)
+        underruns.store(0, ordering: .releasing)
+        trimmed.store(0, ordering: .releasing)
+    }
+
     func trim(to frames: Int) {
         let h = head.load(ordering: .acquiring)
         let t = tail.load(ordering: .relaxed)
@@ -162,6 +209,25 @@ final class Ring: @unchecked Sendable {
     }
 }
 
+/// Atomic is non-copyable, so a realtime callback cannot capture one directly.
+final class AtomicBool: @unchecked Sendable {
+    private let storage = Atomic<Bool>(false)
+    init(_ value: Bool) { storage.store(value, ordering: .releasing) }
+    var value: Bool {
+        get { storage.load(ordering: .acquiring) }
+        set { storage.store(newValue, ordering: .releasing) }
+    }
+}
+
+final class AtomicInt: @unchecked Sendable {
+    private let storage = Atomic<Int>(0)
+    init(_ value: Int) { storage.store(value, ordering: .releasing) }
+    var value: Int {
+        get { storage.load(ordering: .acquiring) }
+        set { storage.store(newValue, ordering: .releasing) }
+    }
+}
+
 // MARK: - Playback
 
 /// Plays a mono ring through the default output, on every channel of the
@@ -172,15 +238,25 @@ final class Player {
     private let device: AudioObjectID
     private var procID: AudioDeviceIOProcID?
     let ring = Ring(frames: 1 << 16)
+    /// The sender picks this once it knows which link it got, so the receiver
+    /// has to be able to change it after the fact.
+    let target = AtomicInt(0)
+    private let primedFlag = AtomicBool(false)
+
+    func setTarget(ms: Int) {
+        target.value = ms * sampleRate / 1000
+    }
 
     init(targetFrames: Int, ioFrames: UInt32) {
+        target.value = targetFrames
         device = defaultOutputDevice()
         guard device != kAudioObjectUnknown else { die("no default output device") }
         let actual = setIOBufferFrames(device, ioFrames)
         log("output \(deviceUID(device)), io buffer \(actual) frames (\(String(format: "%.2f", Double(actual) / 48.0)) ms)")
 
         let ring = self.ring
-        let primed = Atomic<Bool>(false)
+        let target = self.target
+        let primed = primedFlag
         // Playback rate, nudged towards whatever keeps the buffer at target.
         // Bounded well under a tenth of a percent, far below audible pitch
         // change, and the loop is deliberately slow so it tracks clock drift
@@ -194,8 +270,10 @@ final class Player {
             let frames = Int(first.mDataByteSize)
                 / (MemoryLayout<Float>.size * max(Int(first.mNumberChannels), 1))
 
-            if !primed.load(ordering: .acquiring) {
-                if ring.fill >= targetFrames { primed.store(true, ordering: .releasing) }
+            let targetFrames = target.value
+
+            if !primed.value {
+                if ring.fill >= targetFrames { primed.value = true }
                 for buffer in buffers { memset(buffer.mData, 0, Int(buffer.mDataByteSize)) }
                 return
             }
@@ -226,6 +304,14 @@ final class Player {
         }
         guard status == noErr else { die("output IOProc: \(status)") }
         AudioDeviceStart(device, procID)
+    }
+
+    /// The receiver is a login item, so it outlives every sender session and
+    /// keeps pulling from an empty ring in between. Without clearing that, the
+    /// counters report the idle time as underruns and hide the real ones.
+    func reset() {
+        ring.clear()
+        primedFlag.value = false
     }
 
     func stop() {
@@ -366,6 +452,111 @@ final class Tap {
     }
 }
 
+// MARK: - Wire protocol
+
+// One connection carries both audio and control, so volume can travel with the
+// sound instead of needing a second channel or a shell on the other machine.
+//   [type: UInt8][length: UInt32 big-endian][payload]
+enum Frame: UInt8 {
+    case audio = 0      // Int16 mono PCM
+    case volume = 1     // Float32 scalar, 0...1
+    case target = 2     // UInt32 ms; the sender decides once it knows the link
+}
+
+func sendFrame(_ fd: Int32, _ kind: Frame, _ bytes: UnsafeRawPointer, _ count: Int,
+               _ lock: NSLock) -> Bool
+{
+    lock.lock()
+    defer { lock.unlock() }
+    var header = [UInt8](repeating: 0, count: 5)
+    header[0] = kind.rawValue
+    let length = UInt32(count).bigEndian
+    withUnsafeBytes(of: length) { raw in
+        for i in 0 ..< 4 { header[1 + i] = raw[i] }
+    }
+    return writeAll(fd, header, 5) && (count == 0 || writeAll(fd, bytes, count))
+}
+
+func sendVolume(_ fd: Int32, _ level: Float, _ lock: NSLock) -> Bool {
+    var value = Float32(level)
+    return withUnsafeBytes(of: &value) { raw in
+        sendFrame(fd, .volume, raw.baseAddress!, raw.count, lock)
+    }
+}
+
+/// Reads frames until the connection ends, handing each to the caller.
+func readFrames(_ fd: Int32, onAudio: (UnsafePointer<Int16>, Int) -> Void,
+                onVolume: (Float) -> Void,
+                onTarget: (Int) -> Void = { _ in })
+{
+    var header = [UInt8](repeating: 0, count: 5)
+    var payload = [UInt8](repeating: 0, count: 1 << 16)
+    while readAll(fd, &header, 5) {
+        let length = (UInt32(header[1]) << 24) | (UInt32(header[2]) << 16)
+            | (UInt32(header[3]) << 8) | UInt32(header[4])
+        guard Int(length) <= payload.count else { return }
+        guard length == 0 || readAll(fd, &payload, Int(length)) else { return }
+
+        switch Frame(rawValue: header[0]) {
+        case .audio:
+            payload.withUnsafeBytes { raw in
+                let samples = raw.baseAddress!.assumingMemoryBound(to: Int16.self)
+                onAudio(samples, Int(length) / MemoryLayout<Int16>.size)
+            }
+        case .volume:
+            let level = payload.withUnsafeBytes { $0.loadUnaligned(as: Float32.self) }
+            onVolume(level)
+        case .target:
+            let ms = payload.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+            onTarget(Int(UInt32(bigEndian: ms)))
+        case nil:
+            return          // unknown frame type: the stream is no longer trustworthy
+        }
+    }
+}
+
+/// Mirrors the system volume in both directions over the link. Whichever Mac
+/// you change wins; the other follows. The quiet period after applying a remote
+/// change stops the two bouncing a value back and forth forever.
+final class VolumeSync {
+    private let fd: Int32
+    private let lock: NSLock
+    private var lastSeen: Float
+    private var quietUntil = Date.distantPast
+    private let running = Atomic<Bool>(true)
+
+    init(fd: Int32, lock: NSLock) {
+        self.fd = fd
+        self.lock = lock
+        lastSeen = systemVolume() ?? 0
+    }
+
+    func applyRemote(_ level: Float) {
+        guard abs(level - (systemVolume() ?? level)) > 0.01 else { return }
+        setSystemVolume(level)
+        lastSeen = level
+        quietUntil = Date().addingTimeInterval(1.0)
+    }
+
+    func start() {
+        Thread { [self] in
+            _ = sendVolume(fd, lastSeen, lock)
+            while running.load(ordering: .acquiring) {
+                Thread.sleep(forTimeInterval: 0.3)
+                guard Date() > quietUntil, let now = systemVolume() else { continue }
+                if abs(now - lastSeen) > 0.01 {
+                    lastSeen = now
+                    _ = sendVolume(fd, now, lock)
+                }
+            }
+        }.start()
+    }
+
+    /// The receiver takes a new connection each time the sender restarts, so a
+    /// watcher left running would keep writing to a dead socket.
+    func stop() { running.store(false, ordering: .releasing) }
+}
+
 // MARK: - Discovery
 
 let serviceType = "_stereopair._tcp."
@@ -489,6 +680,42 @@ func preferredOrder(_ addresses: [String]) -> [String] {
     }
 }
 
+/// Our own address on the Thunderbolt bridge, if the cable is attached.
+func bridgeAddress() -> String? {
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0, let head = list else { return nil }
+    defer { freeifaddrs(head) }
+
+    var node: UnsafeMutablePointer<ifaddrs>? = head
+    while let current = node {
+        defer { node = current.pointee.ifa_next }
+        guard String(cString: current.pointee.ifa_name).hasPrefix("bridge"),
+              let raw = current.pointee.ifa_addr,
+              raw.pointee.sa_family == sa_family_t(AF_INET)
+        else { continue }
+        var sin = raw.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &sin.sin_addr, &text, socklen_t(INET_ADDRSTRLEN))
+        return String(cString: text)
+    }
+    return nil
+}
+
+/// Which of our addresses a connected socket is actually using. Two link-local
+/// addresses can both accept a connection while only one of them is the cable,
+/// and this is the only way to tell them apart from the outside.
+func localAddress(of fd: Int32) -> String? {
+    var addr = sockaddr_in()
+    var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let ok = withUnsafeMutablePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &size) }
+    }
+    guard ok == 0 else { return nil }
+    var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    inet_ntop(AF_INET, &addr.sin_addr, &text, socklen_t(INET_ADDRSTRLEN))
+    return String(cString: text)
+}
+
 // MARK: - Sockets
 
 func readAll(_ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ bytes: Int) -> Bool {
@@ -595,13 +822,24 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         candidates = [(host, port)]
     }
 
+    // Prefer whichever candidate actually routes over the Thunderbolt bridge,
+    // keeping the first that connects as the fallback.
+    let ourBridge = bridgeAddress()
     var connection: Int32?
     var reached = ""
     for (address, candidatePort) in candidates {
-        if let fd = connectTo(address, candidatePort) {
+        guard let fd = connectTo(address, candidatePort) else { continue }
+        if let bridge = ourBridge, localAddress(of: fd) == bridge {
+            connection.map { close($0) }
             connection = fd
             reached = address
             break
+        }
+        if connection == nil {
+            connection = fd
+            reached = address
+        } else {
+            close(fd)
         }
     }
     guard let fd = connection else {
@@ -612,10 +850,15 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         """)
     }
     disableNagle(fd)
-    let link = reached.hasPrefix("169.254.") ? "thunderbolt" : "network"
-    log("connected to \(reached):\(port) over \(link)")
+    let wired = ourBridge != nil && localAddress(of: fd) == ourBridge
+    let link = wired ? "thunderbolt" : "network"
 
-    let targetFrames = targetMs * sampleRate / 1000
+    // Only now is the link known, and it decides the target: 20 ms cannot
+    // survive Wi-Fi, whose jitter alone is larger than the whole buffer.
+    let negotiated = targetMs > 0 ? targetMs : (wired ? 20 : 150)
+    log("connected to \(reached):\(port) over \(link), target \(negotiated) ms")
+
+    let targetFrames = negotiated * sampleRate / 1000
 
     // Output first, tap second: the tap can only exclude this process once it
     // has an output device open, and being excluded is what keeps our own
@@ -633,6 +876,22 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
     // receiver would drain, then take a burst when audio resumed. Padding
     // without the deadline is the opposite mistake: a chunk per gap *and* a
     // chunk per capture is twice real time.
+    let writeLock = NSLock()
+    var announced = UInt32(negotiated).bigEndian
+    _ = withUnsafeBytes(of: &announced) {
+        sendFrame(fd, .target, $0.baseAddress!, $0.count, writeLock)
+    }
+
+    let volumes = VolumeSync(fd: fd, lock: writeLock)
+    volumes.start()
+
+    Thread {
+        readFrames(fd, onAudio: { _, _ in }, onVolume: { volumes.applyRemote($0) })
+        log("receiver gone")
+        teardown()
+        exit(0)
+    }.start()
+
     let chunk = 256
     let chunkNanos = UInt64(chunk) * 1_000_000_000 / UInt64(sampleRate)
     let buffer = UnsafeMutablePointer<Int16>.allocate(capacity: chunk)
@@ -644,7 +903,7 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         if got < chunk {
             buffer.advanced(by: got).update(repeating: 0, count: chunk - got)
         }
-        guard writeAll(fd, buffer, chunk * MemoryLayout<Int16>.size) else {
+        guard sendFrame(fd, .audio, buffer, chunk * MemoryLayout<Int16>.size, writeLock) else {
             log("receiver gone")
             teardown()
             exit(0)
@@ -685,16 +944,26 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
     let advertiser = Advertiser()
     advertiser.start(port: port)
 
-    let chunk = 256
-    let buffer = UnsafeMutablePointer<Int16>.allocate(capacity: chunk)
     while true {
         let client = accept(listener, nil, nil)
         guard client >= 0 else { continue }
         disableNagle(client)
         log("sender connected")
-        while readAll(client, buffer, chunk * MemoryLayout<Int16>.size) {
-            player.ring.write(buffer, chunk)
-        }
+        player.reset()
+
+        let writeLock = NSLock()
+        let volumes = VolumeSync(fd: client, lock: writeLock)
+        volumes.start()
+
+        readFrames(client,
+                   onAudio: { samples, count in player.ring.write(samples, count) },
+                   onVolume: { volumes.applyRemote($0) },
+                   onTarget: { ms in
+                       log("target set to \(ms) ms by the sender")
+                       player.setTarget(ms: ms)
+                   })
+
+        volumes.stop()
         log("sender disconnected")
         close(client)
     }
@@ -741,7 +1010,7 @@ func runList() -> Never {
 var mode = ""
 var host = ""
 var port: UInt16 = 4711
-var targetMs = 20
+var targetMs = 0   // 0 = decide from the link
 var ioFrames: UInt32 = 128
 var peerName: String?
 
@@ -763,7 +1032,9 @@ while let arg = args.first {
     case "--list":
         mode = "list"
     case "--port": port = UInt16(args.removeFirst()) ?? 4711
-    case "--target-ms": targetMs = Int(args.removeFirst()) ?? 20
+    case "--target-ms":
+        let value = args.removeFirst()
+        targetMs = value == "auto" ? 0 : (Int(value) ?? 0)
     case "--io-frames": ioFrames = UInt32(args.removeFirst()) ?? 128
     case "--debug-tap":
         tapLayoutReports = 3
@@ -778,7 +1049,7 @@ signal(SIGPIPE, SIG_IGN)
 
 switch mode {
 case "send": runSender(host: host, port: port, targetMs: targetMs, ioFrames: ioFrames, peerName: peerName)
-case "recv": runReceiver(port: port, targetMs: targetMs, ioFrames: ioFrames)
+case "recv": runReceiver(port: port, targetMs: targetMs > 0 ? targetMs : 150, ioFrames: ioFrames)
 case "selftest": runSelfTest(seconds: 3)
 case "list": runList()
 default: die("need --send [host], --recv, or --list")

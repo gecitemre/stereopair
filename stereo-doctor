@@ -17,16 +17,16 @@ command -v swiftc >/dev/null && pass "swift toolchain" || bad "swiftc missing �
 [ -d bin/StereoMenu.app ] && pass "StereoMenu.app built" || bad "not built — run ./build.sh"
 
 echo
-echo "second Mac ($PEER)"
-if ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" true 2>/dev/null; then
-	pass "reachable over ssh with a key"
-	if ssh -o BatchMode=yes "$PEER" 'test -x ~/stereopair/StereoPair.app/Contents/MacOS/stereopair' 2>/dev/null; then
-		pass "StereoPair.app deployed"
-	else
-		bad "not deployed — run ./deploy-peer.sh"
-	fi
+echo "second Mac"
+# No ssh here on purpose: once deployed, the receiver is a login item and is
+# found over Bonjour, so this checks what actually matters at run time.
+FOUND=$(bin/StereoPair.app/Contents/MacOS/stereopair --list 2>&1 | grep -v "no receivers" | head -1)
+if [ -n "$FOUND" ]; then
+	pass "receiver found: $FOUND"
 else
-	bad "cannot ssh to $PEER — enable Remote Login there, then ssh-copy-id $PEER"
+	bad "no receiver on the network — run ./deploy-peer.sh, or check that the"
+	echo "        other Mac is awake and StereoPair is allowed under Privacy &"
+	echo "        Security > Local Network there"
 fi
 
 echo
@@ -62,7 +62,7 @@ fi
 
 echo
 echo "local network permission (this Mac)"
-if ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" true 2>/dev/null; then
+if true; then
 	LOG=$(cat run/stereopair.log 2>/dev/null)
 	if echo "$LOG" | grep -q "No route to host"; then
 		bad "connections are being blocked — allow StereoPair under System Settings >"
@@ -76,18 +76,6 @@ if ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" true 2>/dev/null; then
 	fi
 fi
 
-echo
-echo "levels"
-LOCAL_VOL=$(osascript -e 'output volume of (get volume settings)' 2>/dev/null)
-PEER_VOL=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$PEER" \
-	'osascript -e "output volume of (get volume settings)"' 2>/dev/null)
-if [ -n "$LOCAL_VOL" ] && [ -n "$PEER_VOL" ]; then
-	if [ "$((LOCAL_VOL - PEER_VOL))" -le 4 ] && [ "$((PEER_VOL - LOCAL_VOL))" -le 4 ]; then
-		pass "system volumes match ($LOCAL_VOL / $PEER_VOL)"
-	else
-		warn "system volumes differ ($LOCAL_VOL vs $PEER_VOL) — the sides will not match"
-	fi
-fi
 
 echo
 [ "$FAILED" = 0 ] && echo "all good." || echo "fix the FAIL lines above, then re-run."

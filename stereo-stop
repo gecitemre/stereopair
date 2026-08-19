@@ -1,18 +1,8 @@
 #!/bin/bash
+# Only stops this Mac's sender. The receiver on the other Mac stays running and
+# idle, which is the point of it being a login item: nothing to start remotely.
 cd "$(dirname "$0")"
-source ./config.sh
 
-# The bracket keeps pkill from matching this command line itself.
 pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair' 2>/dev/null
-
-ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
-	"pkill -f 'StereoPair[.]app/Contents/MacOS/stereopair'" 2>/dev/null
-
-# Only tear down volume sync when we own it. The menu bar app toggles the two
-# independently and passes SYNC_VOLUME=0.
-if [ "$SYNC_VOLUME" = 1 ]; then
-	./stereo-volume-sync stop > /dev/null 2>&1
-fi
-
 rm -f "$PWD/run/stereopair.pid"
 echo "stereo stopped"

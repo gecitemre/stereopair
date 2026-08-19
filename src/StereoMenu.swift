@@ -14,8 +14,6 @@ final class Controller: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let stereoItem = NSMenuItem(title: "Stereo Sync", action: #selector(toggleStereo),
                                         keyEquivalent: "")
-    private let volumeItem = NSMenuItem(title: "Volume Sync", action: #selector(toggleVolume),
-                                        keyEquivalent: "")
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var busy = false
 
@@ -24,10 +22,8 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let menu = NSMenu()
         menu.delegate = self
-        for item in [stereoItem, volumeItem] {
-            item.target = self
-            menu.addItem(item)
-        }
+        stereoItem.target = self
+        menu.addItem(stereoItem)
         menu.addItem(.separator())
         statusLine.isEnabled = false
         menu.addItem(statusLine)
@@ -56,19 +52,16 @@ final class Controller: NSObject, NSMenuDelegate {
     }
 
     private var stereoOn: Bool { isRunning("stereopair.pid") }
-    private var volumeOn: Bool { isRunning("volume.pid") }
 
     private func refresh() {
         let stereo = stereoOn
         stereoItem.state = stereo ? .on : .off
-        volumeItem.state = volumeOn ? .on : .off
         stereoItem.isEnabled = !busy
-        volumeItem.isEnabled = !busy
 
         if busy {
             statusLine.title = "Working…"
         } else if stereo {
-            statusLine.title = "Left: this Mac · Right: second Mac"
+            statusLine.title = "Left: this Mac · Right: paired Mac"
         } else {
             statusLine.title = "Not running"
         }
@@ -123,14 +116,9 @@ final class Controller: NSObject, NSMenuDelegate {
     // MARK: - Actions
 
     @objc private func toggleStereo() {
-        // The menu owns the volume watcher, so both scripts must leave it alone.
-        let environment = ["SYNC_VOLUME": "0"]
-        run(stereoOn ? "stereo-stop" : "stereo-start", environment: environment)
+        run(stereoOn ? "stereo-stop" : "stereo-start")
     }
 
-    @objc private func toggleVolume() {
-        run("stereo-volume-sync", [volumeOn ? "stop" : "start"])
-    }
 
     @objc private func playCheck() {
         let wav = projectRoot.appendingPathComponent("channel-check.wav")
