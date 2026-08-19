@@ -9,3 +9,4 @@ channel-check.wav
 .DS_Store
 bin/StereoPair.app/
 bin/Lowlat.app/
+bin/*.dmg

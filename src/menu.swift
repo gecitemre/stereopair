@@ -27,6 +27,16 @@ final class Menu: NSObject, NSMenuDelegate {
         Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/stereopair")
     }
 
+    /// Children write here rather than to a discarded stderr: without it there
+    /// is no way to tell a working pair from a silently broken one, or to see
+    /// the buffer drifting.
+    private func logPath(_ role: String) -> String {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/StereoPair")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("\(role).log").path
+    }
+
     override init() {
         super.init()
 
@@ -74,7 +84,7 @@ final class Menu: NSObject, NSMenuDelegate {
 
     private func startReceiver() {
         guard receiver == nil || receiver?.isRunning == false else { return }
-        receiver = spawn(["--recv"])
+        receiver = spawn(["--recv", "--log", logPath("receiver")])
     }
 
     @objc private func stopSending() {
@@ -95,7 +105,8 @@ final class Menu: NSObject, NSMenuDelegate {
         receiver = nil
 
         let address = preferredOrder(peer.addresses).first ?? ""
-        sender = spawn(["--send", address, "--target-ms", "auto"])
+        sender = spawn(["--send", address, "--target-ms", "auto",
+                        "--log", logPath("sender")])
         sendingTo = peer.name
         refresh()
     }
