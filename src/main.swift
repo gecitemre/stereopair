@@ -12,6 +12,7 @@ var port: UInt16 = 4711
 var targetMs = 0   // 0 = decide from the link
 var ioFrames: UInt32 = 128
 var peerName: String?
+var startIdle = false
 
 var args = Array(CommandLine.arguments.dropFirst())
 while let arg = args.first {
@@ -26,6 +27,8 @@ while let arg = args.first {
             args.removeFirst()
             host = value
         }
+    case "--idle":
+        startIdle = true
     case "--peer-name":
         peerName = args.removeFirst()
     case "--list":
@@ -47,7 +50,8 @@ while let arg = args.first {
 signal(SIGPIPE, SIG_IGN)
 
 switch mode {
-case "send": runSender(host: host, port: port, targetMs: targetMs, ioFrames: ioFrames, peerName: peerName)
+case "send": runSender(host: host, port: port, targetMs: targetMs, ioFrames: ioFrames,
+                       peerName: peerName, startIdle: startIdle)
 case "recv": runReceiver(port: port, targetMs: targetMs > 0 ? targetMs : 150, ioFrames: ioFrames)
 case "selftest": runSelfTest(seconds: 3)
 case "list": runList()

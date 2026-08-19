@@ -152,6 +152,18 @@ final class Ring: @unchecked Sendable {
 
     /// Without pulling the level back, any startup burst or accumulated drift
     /// becomes permanent latency.
+    var tailPosition: Int { tail.load(ordering: .acquiring) }
+    var headPosition: Int { head.load(ordering: .acquiring) }
+
+    /// Jump straight to a position, clamped to what we actually hold.
+    func seek(to position: Int) {
+        let h = head.load(ordering: .acquiring)
+        let t = tail.load(ordering: .relaxed)
+        let clamped = max(t, min(position, h))
+        if clamped > t { trimmed.add(clamped - t, ordering: .relaxed) }
+        tail.store(clamped, ordering: .releasing)
+    }
+
     func clear() {
         tail.store(head.load(ordering: .acquiring), ordering: .releasing)
         underruns.store(0, ordering: .releasing)
@@ -234,10 +246,41 @@ final class AtomicInt: @unchecked Sendable {
 /// device. Holds silence until the ring first reaches `targetFrames`, so the
 /// two machines start from the same depth rather than whatever the first
 /// callback happened to find.
+/// Where a given ring position is meant to be heard, in the sender's clock.
+/// Everything else is derived from this: playback follows the schedule, not the
+/// arrival of packets, which is what keeps the two machines together when the
+/// network delivers in bursts.
+final class Schedule: @unchecked Sendable {
+    private let lock = NSLock()
+    private var position = 0
+    private var playTime: UInt64 = 0
+    private(set) var valid = false
+
+    func set(position newPosition: Int, playTime newPlayTime: UInt64) {
+        lock.lock()
+        position = newPosition
+        playTime = newPlayTime
+        valid = true
+        lock.unlock()
+    }
+
+    /// The position that should be playing at `time` (sender clock).
+    func position(at time: UInt64) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard valid else { return nil }
+        let delta = Int64(bitPattern: time) - Int64(bitPattern: playTime)
+        return position + Int(delta * Int64(sampleRate) / 1_000_000_000)
+    }
+}
+
 final class Player {
     private let device: AudioObjectID
     private var procID: AudioDeviceIOProcID?
     let ring = Ring(frames: 1 << 16)
+    let schedule = Schedule()
+    /// Sender clock minus ours. Zero when the sender is this machine.
+    let clockOffset = AtomicInt(0)
     /// The sender picks this once it knows which link it got, so the receiver
     /// has to be able to change it after the fact.
     let target = AtomicInt(0)
@@ -264,7 +307,9 @@ final class Player {
         nonisolated(unsafe) var ratio = 1.0
         nonisolated(unsafe) var phase = 0.0
 
-        let status = AudioDeviceCreateIOProcIDWithBlock(&procID, device, nil) { _, _, _, outputData, _ in
+        let schedule = self.schedule
+        let offsetBox = self.clockOffset
+        let status = AudioDeviceCreateIOProcIDWithBlock(&procID, device, nil) { _, _, _, outputData, outputTime in
             let buffers = UnsafeMutableAudioBufferListPointer(outputData)
             guard let first = buffers.first else { return }
             let frames = Int(first.mDataByteSize)
@@ -278,12 +323,31 @@ final class Player {
                 return
             }
 
-            // A burst still needs discarding; the rate loop only handles slow drift.
-            if ring.fill > targetFrames * 3 { ring.trim(to: targetFrames) }
+            // When this buffer will actually reach the speakers, expressed in
+            // the sender's clock. Core Audio hands us that time; using it is
+            // what makes playback independent of when packets turned up.
+            let hostNanos = hostToNanos(outputTime.pointee.mHostTime)
+            let senderNow = UInt64(bitPattern: Int64(bitPattern: hostNanos)
+                + Int64(offsetBox.value))
 
-            let error = Double(ring.fill - targetFrames) / Double(targetFrames)
-            let target = 1.0 + max(-0.0008, min(0.0008, error * 0.0008))
-            ratio += (target - ratio) * 0.02
+            var timingError = 0.0
+            if let wanted = schedule.position(at: senderNow) {
+                let drift = wanted - ring.tailPosition
+                timingError = Double(drift) / Double(sampleRate)
+                // A big gap means something jumped — a reconnect, a stall, a
+                // machine waking. Step to the right place rather than crawling
+                // there at 0.08%, which would take minutes and sound wrong the
+                // whole way.
+                if abs(drift) > sampleRate / 20 {
+                    ring.seek(to: wanted)
+                    timingError = 0
+                }
+            }
+
+            // Small errors are corrected by playing fractionally faster or
+            // slower, which is inaudible, rather than by skipping samples.
+            let correction = max(-0.0008, min(0.0008, timingError * 0.02))
+            ratio += (1.0 + correction - ratio) * 0.05
 
             let scratch = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
             defer { scratch.deallocate() }
@@ -429,7 +493,20 @@ final class Tap {
             }
         }
         guard status == noErr else { destroy(); die("tap IOProc: \(status)") }
-        AudioDeviceStart(device, procID)
+    }
+
+    /// Creating and destroying a tap per session is what wedges coreaudiod
+    /// until it is killed. The tap is made once and kept; only capture starts
+    /// and stops. `mutedWhenTapped` mutes apps only while the tap is being
+    /// read, so a stopped tap leaves the machine's audio alone.
+    func startCapture() {
+        guard let procID, aggregateID != kAudioObjectUnknown else { return }
+        AudioDeviceStart(aggregateID, procID)
+    }
+
+    func stopCapture() {
+        guard let procID, aggregateID != kAudioObjectUnknown else { return }
+        AudioDeviceStop(aggregateID, procID)
     }
 
     /// Taps and aggregate devices outlive the process unless destroyed. Leaked
@@ -458,9 +535,64 @@ final class Tap {
 // sound instead of needing a second channel or a shell on the other machine.
 //   [type: UInt8][length: UInt32 big-endian][payload]
 enum Frame: UInt8 {
-    case audio = 0      // Int16 mono PCM
-    case volume = 1     // Float32 scalar, 0...1
-    case target = 2     // UInt32 ms; the sender decides once it knows the link
+    case audio = 0        // UInt64 play time (sender clock, ns) + Int16 mono PCM
+    case volume = 1       // Float32 scalar, 0...1
+    case target = 2       // UInt32 ms; the sender decides once it knows the link
+    case timeRequest = 3  // UInt64 receiver clock
+    case timeReply = 4    // UInt64 echo + UInt64 sender clock
+}
+
+/// A monotonic clock in nanoseconds, shared by everything that has to agree on
+/// when a sample should be heard.
+func nowNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+/// Core Audio reports playback times in host ticks, which are the same units as
+/// the monotonic clock only after scaling by the machine's timebase.
+let hostTimebase: (numer: UInt64, denom: UInt64) = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return (UInt64(info.numer), UInt64(info.denom))
+}()
+
+func hostToNanos(_ hostTime: UInt64) -> UInt64 {
+    hostTime / hostTimebase.denom &* hostTimebase.numer
+        &+ (hostTime % hostTimebase.denom) &* hostTimebase.numer / hostTimebase.denom
+}
+
+/// The two machines' monotonic clocks start whenever each booted, so they share
+/// no epoch. Round-trip a pair of readings and take the offset from the fastest
+/// exchange seen: the quickest round trip is the one least distorted by
+/// queueing, which is the whole difficulty on Wi-Fi.
+final class ClockSync: @unchecked Sendable {
+    private let lock = NSLock()
+    private var offset: Int64 = 0        // sender clock - our clock
+    private var bestRoundTrip: UInt64 = .max
+    private(set) var settled = false
+
+    var offsetNanos: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return offset
+    }
+
+    func sample(sent: UInt64, remote: UInt64, received: UInt64) {
+        let roundTrip = received &- sent
+        lock.lock()
+        defer { lock.unlock() }
+        // Decay the best estimate so a lucky early sample cannot pin it forever.
+        if roundTrip < bestRoundTrip || !settled {
+            bestRoundTrip = roundTrip
+            let midpoint = sent &+ roundTrip / 2
+            offset = Int64(bitPattern: remote) - Int64(bitPattern: midpoint)
+            settled = true
+        }
+    }
+
+    func relax() {
+        lock.lock()
+        bestRoundTrip = bestRoundTrip &+ bestRoundTrip / 8 &+ 1_000
+        lock.unlock()
+    }
 }
 
 func sendFrame(_ fd: Int32, _ kind: Frame, _ bytes: UnsafeRawPointer, _ count: Int,
@@ -477,6 +609,20 @@ func sendFrame(_ fd: Int32, _ kind: Frame, _ bytes: UnsafeRawPointer, _ count: I
     return writeAll(fd, header, 5) && (count == 0 || writeAll(fd, bytes, count))
 }
 
+func sendUInt64s(_ fd: Int32, _ kind: Frame, _ values: [UInt64], _ lock: NSLock) -> Bool {
+    var bytes = [UInt8]()
+    for value in values {
+        withUnsafeBytes(of: value.bigEndian) { bytes.append(contentsOf: $0) }
+    }
+    return sendFrame(fd, kind, bytes, bytes.count, lock)
+}
+
+func readUInt64(_ bytes: [UInt8], _ index: Int) -> UInt64 {
+    var value: UInt64 = 0
+    for i in 0 ..< 8 { value = (value << 8) | UInt64(bytes[index * 8 + i]) }
+    return value
+}
+
 func sendVolume(_ fd: Int32, _ level: Float, _ lock: NSLock) -> Bool {
     var value = Float32(level)
     return withUnsafeBytes(of: &value) { raw in
@@ -485,9 +631,11 @@ func sendVolume(_ fd: Int32, _ level: Float, _ lock: NSLock) -> Bool {
 }
 
 /// Reads frames until the connection ends, handing each to the caller.
-func readFrames(_ fd: Int32, onAudio: (UnsafePointer<Int16>, Int) -> Void,
+func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Void,
                 onVolume: (Float) -> Void,
-                onTarget: (Int) -> Void = { _ in })
+                onTarget: (Int) -> Void = { _ in },
+                onTimeRequest: (UInt64) -> Void = { _ in },
+                onTimeReply: (UInt64, UInt64) -> Void = { _, _ in })
 {
     var header = [UInt8](repeating: 0, count: 5)
     var payload = [UInt8](repeating: 0, count: 1 << 16)
@@ -499,9 +647,12 @@ func readFrames(_ fd: Int32, onAudio: (UnsafePointer<Int16>, Int) -> Void,
 
         switch Frame(rawValue: header[0]) {
         case .audio:
+            guard length >= 8 else { return }
+            let playTime = readUInt64(payload, 0)
             payload.withUnsafeBytes { raw in
-                let samples = raw.baseAddress!.assumingMemoryBound(to: Int16.self)
-                onAudio(samples, Int(length) / MemoryLayout<Int16>.size)
+                let samples = raw.baseAddress!.advanced(by: 8)
+                    .assumingMemoryBound(to: Int16.self)
+                onAudio(playTime, samples, (Int(length) - 8) / MemoryLayout<Int16>.size)
             }
         case .volume:
             let level = payload.withUnsafeBytes { $0.loadUnaligned(as: Float32.self) }
@@ -509,6 +660,12 @@ func readFrames(_ fd: Int32, onAudio: (UnsafePointer<Int16>, Int) -> Void,
         case .target:
             let ms = payload.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
             onTarget(Int(UInt32(bigEndian: ms)))
+        case .timeRequest:
+            guard length >= 8 else { return }
+            onTimeRequest(readUInt64(payload, 0))
+        case .timeReply:
+            guard length >= 16 else { return }
+            onTimeReply(readUInt64(payload, 0), readUInt64(payload, 1))
         case nil:
             return          // unknown frame type: the stream is no longer trustworthy
         }
@@ -738,6 +895,66 @@ func localAddress(of fd: Int32) -> String? {
     return String(cString: text)
 }
 
+/// A browser that keeps running, rather than a snapshot taken when the menu
+/// opens. Resolving a service takes longer than a menu click is willing to
+/// wait, and a short window returns peers with no addresses yet — which look
+/// like no peers at all.
+final class LiveDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
+    private let browser = NetServiceBrowser()
+    private var services: [NetService] = []
+    private var cached: [Peer] = []
+    private let lock = NSLock()
+
+    var peers: [Peer] {
+        lock.lock()
+        defer { lock.unlock() }
+        return cached
+    }
+
+    func start() {
+        let thread = Thread { [self] in
+            browser.delegate = self
+            browser.searchForServices(ofType: serviceType, inDomain: "local.")
+            RunLoop.current.run()
+        }
+        thread.name = "discovery"
+        thread.start()
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService,
+                           moreComing: Bool)
+    {
+        service.delegate = self
+        services.append(service)
+        service.resolve(withTimeout: 5)
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService,
+                           moreComing: Bool)
+    {
+        services.removeAll { $0.name == service.name }
+        rebuild()
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) { rebuild() }
+
+    private func rebuild() {
+        let ours = localAddresses()
+        var list: [Peer] = []
+        for service in services {
+            var found = (service.addresses ?? []).compactMap(ipv4)
+            if let host = service.hostName { found += addresses(ofHost: host) }
+            found = Array(Set(found))
+            // Every copy advertises, so a browse always finds this Mac too.
+            guard !found.isEmpty, found.allSatisfy({ !ours.contains($0) }) else { continue }
+            list.append(Peer(name: service.name, addresses: found, port: service.port))
+        }
+        lock.lock()
+        cached = list
+        lock.unlock()
+    }
+}
+
 // MARK: - Sockets
 
 func readAll(_ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ bytes: Int) -> Bool {
@@ -816,126 +1033,162 @@ func connectTo(_ host: String, _ port: UInt16) -> Int32? {
     return nil
 }
 
+/// Set by SIGUSR2 (play) and SIGUSR1 (stop). The process stays alive across
+/// both so the tap it owns is created once, not once per session.
+nonisolated(unsafe) let senderActive = AtomicBool(false)
+
 func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
-               peerName: String?) -> Never
+               peerName: String?, startIdle: Bool) -> Never
 {
     installTeardownHandlers()
 
-    var candidates: [(String, UInt16)] = []
-    if host.isEmpty || host == "auto" {
-        log("looking for a receiver…")
-        let peers = Discovery().search(timeout: 4)
-        let chosen = peerName.map { wanted in peers.filter { $0.name == wanted } } ?? peers
-        guard let peer = chosen.first else {
-            die("""
-            found no receiver on the network.
-              Start StereoPair on the other Mac, or pass its address directly.
-              If nothing is ever found, allow this app under System Settings >
-              Privacy & Security > Local Network.
-            """)
-        }
-        if peers.count > 1 {
-            log("found \(peers.count) receivers, using \"\(peer.name)\"")
-        } else {
-            log("found \"\(peer.name)\"")
-        }
-        candidates = preferredOrder(peer.addresses).map { ($0, UInt16(peer.port)) }
-    } else {
-        candidates = [(host, port)]
+    for (number, wanted) in [(SIGUSR1, false), (SIGUSR2, true)] {
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+        source.setEventHandler { senderActive.value = wanted }
+        source.resume()
+        _ = Unmanaged.passRetained(source as AnyObject)
     }
-
-    // Prefer whichever candidate actually routes over the Thunderbolt bridge,
-    // keeping the first that connects as the fallback.
-    let ourBridge = bridgeAddress()
-    var connection: Int32?
-    var reached = ""
-    for (address, candidatePort) in candidates {
-        guard let fd = connectTo(address, candidatePort) else { continue }
-        if let bridge = ourBridge, localAddress(of: fd) == bridge {
-            connection.map { close($0) }
-            connection = fd
-            reached = address
-            break
-        }
-        if connection == nil {
-            connection = fd
-            reached = address
-        } else {
-            close(fd)
-        }
-    }
-    guard let fd = connection else {
-        die("""
-        could not reach the receiver.
-          "No route to host" above usually means macOS blocked the connection.
-          Allow this app under System Settings > Privacy & Security > Local Network.
-        """)
-    }
-    disableNagle(fd)
-    let wired = ourBridge != nil && localAddress(of: fd) == ourBridge
-    let link = wired ? "thunderbolt" : "network"
-
-    // Only now is the link known, and it decides the target: 20 ms cannot
-    // survive Wi-Fi, whose jitter alone is larger than the whole buffer.
-    let negotiated = targetMs > 0 ? targetMs : (wired ? 20 : 150)
-    log("connected to \(reached):\(port) over \(link), target \(negotiated) ms")
-
-    let targetFrames = negotiated * sampleRate / 1000
+    senderActive.value = !startIdle
 
     // Output first, tap second: the tap can only exclude this process once it
     // has an output device open, and being excluded is what keeps our own
     // playback out of the capture.
-    let player = Player(targetFrames: targetFrames, ioFrames: ioFrames)
+    let player = Player(targetFrames: targetMs > 0 ? targetMs * sampleRate / 1000
+                                                   : 20 * sampleRate / 1000,
+                        ioFrames: ioFrames)
     livePlayer = player
     let outbound = Ring(frames: 1 << 16)
-    liveTap = Tap(left: player.ring, right: outbound)
-    log("tapping; left here, right to \(host), target \(targetMs) ms")
+    let tap = Tap(left: player.ring, right: outbound)
+    liveTap = tap
+    log("ready" + (startIdle ? " (idle)" : ""))
     startStatsThread("left", player.ring)
-
-    // Send exactly one chunk per chunk-period, against a monotonic deadline.
-    // Waiting for a full chunk instead would stop the stream dead whenever
-    // nothing is playing — the tap produces nothing during silence — and the
-    // receiver would drain, then take a burst when audio resumed. Padding
-    // without the deadline is the opposite mistake: a chunk per gap *and* a
-    // chunk per capture is twice real time.
-    let writeLock = NSLock()
-    var announced = UInt32(negotiated).bigEndian
-    _ = withUnsafeBytes(of: &announced) {
-        sendFrame(fd, .target, $0.baseAddress!, $0.count, writeLock)
-    }
-
-    let volumes = VolumeSync(fd: fd, lock: writeLock)
-    volumes.start()
-
-    Thread {
-        readFrames(fd, onAudio: { _, _ in }, onVolume: { volumes.applyRemote($0) })
-        log("receiver gone")
-        teardown()
-        exit(0)
-    }.start()
 
     let chunk = 256
     let chunkNanos = UInt64(chunk) * 1_000_000_000 / UInt64(sampleRate)
     let buffer = UnsafeMutablePointer<Int16>.allocate(capacity: chunk)
-    var deadline = DispatchTime.now().uptimeNanoseconds
 
     while true {
-        deadline &+= chunkNanos
-        let got = outbound.read(buffer, chunk)
-        if got < chunk {
-            buffer.advanced(by: got).update(repeating: 0, count: chunk - got)
-        }
-        guard sendFrame(fd, .audio, buffer, chunk * MemoryLayout<Int16>.size, writeLock) else {
-            log("receiver gone")
-            teardown()
-            exit(0)
-        }
-        let now = DispatchTime.now().uptimeNanoseconds
-        if deadline > now {
-            usleep(useconds_t((deadline - now) / 1000))
+        while !senderActive.value { usleep(100_000) }
+
+        var candidates: [(String, UInt16)] = []
+        if host.isEmpty || host == "auto" {
+            let peers = Discovery().search(timeout: 4)
+            let chosen = peerName.map { wanted in peers.filter { $0.name == wanted } } ?? peers
+            guard let peer = chosen.first else {
+                log("no receiver found; waiting")
+                senderActive.value = false
+                continue
+            }
+            log("found \"\(peer.name)\"")
+            candidates = preferredOrder(peer.addresses).map { ($0, UInt16(peer.port)) }
         } else {
-            deadline = now // fell behind; do not try to catch up in a burst
+            candidates = [(host, port)]
         }
+
+        // Prefer whichever candidate actually routes over the Thunderbolt
+        // bridge, keeping the first that connects as the fallback.
+        let ourBridge = bridgeAddress()
+        var connection: Int32?
+        var reached = ""
+        for (address, candidatePort) in candidates {
+            guard let fd = connectTo(address, candidatePort) else { continue }
+            if let bridge = ourBridge, localAddress(of: fd) == bridge {
+                connection.map { close($0) }
+                connection = fd
+                reached = address
+                break
+            }
+            if connection == nil {
+                connection = fd
+                reached = address
+            } else {
+                close(fd)
+            }
+        }
+        guard let fd = connection else {
+            log("could not reach the receiver; waiting")
+            senderActive.value = false
+            continue
+        }
+        disableNagle(fd)
+
+        let wired = ourBridge != nil && localAddress(of: fd) == ourBridge
+        let negotiated = targetMs > 0 ? targetMs : (wired ? 20 : 150)
+        log("connected to \(reached) over \(wired ? "thunderbolt" : "network"), "
+            + "target \(negotiated) ms")
+
+        player.setTarget(ms: negotiated)
+        player.reset()
+
+        let writeLock = NSLock()
+        var announced = UInt32(negotiated).bigEndian
+        _ = withUnsafeBytes(of: &announced) {
+            sendFrame(fd, .target, $0.baseAddress!, $0.count, writeLock)
+        }
+
+        let volumes = VolumeSync(fd: fd, lock: writeLock)
+        volumes.start()
+
+        let alive = AtomicBool(true)
+        Thread {
+            readFrames(fd,
+                       onAudio: { _, _, _ in },
+                       onVolume: { volumes.applyRemote($0) },
+                       onTarget: { _ in },
+                       onTimeRequest: { asked in
+                           // Reply with our clock so the receiver can work out
+                           // the offset between the two machines.
+                           _ = sendUInt64s(fd, .timeReply, [asked, nowNanos()], writeLock)
+                       })
+            alive.value = false
+        }.start()
+
+        tap.startCapture()
+
+        // One timeline for both machines: sample N is heard at start + N/48000.
+        // The local player follows the same schedule with a zero offset, so the
+        // two channels line up by construction instead of by luck.
+        var sent = 0
+        let start = nowNanos() &+ UInt64(negotiated) &* 1_000_000
+        player.clockOffset.value = 0
+        player.schedule.set(position: player.ring.tailPosition, playTime: start)
+
+        var deadline = DispatchTime.now().uptimeNanoseconds
+
+        // Send exactly one chunk per chunk-period, against a monotonic
+        // deadline. Waiting for a full chunk would stop the stream whenever
+        // nothing is playing — the tap produces nothing during silence — and
+        // the receiver would drain, then take a burst when audio resumed.
+        // Padding without the deadline is the opposite mistake: a chunk per gap
+        // *and* a chunk per capture is twice real time.
+        while alive.value, senderActive.value {
+            deadline &+= chunkNanos
+            let got = outbound.read(buffer, chunk)
+            if got < chunk {
+                buffer.advanced(by: got).update(repeating: 0, count: chunk - got)
+            }
+            let playTime = start &+ UInt64(sent) &* 1_000_000_000 / UInt64(sampleRate)
+            var stamped = [UInt8]()
+            withUnsafeBytes(of: playTime.bigEndian) { stamped.append(contentsOf: $0) }
+            buffer.withMemoryRebound(to: UInt8.self, capacity: chunk * 2) { raw in
+                stamped.append(contentsOf: UnsafeBufferPointer(start: raw, count: chunk * 2))
+            }
+            guard sendFrame(fd, .audio, stamped, stamped.count, writeLock) else { break }
+            sent += chunk
+            let now = DispatchTime.now().uptimeNanoseconds
+            if deadline > now {
+                usleep(useconds_t((deadline - now) / 1000))
+            } else {
+                deadline = now
+            }
+        }
+
+        tap.stopCapture()
+        volumes.stop()
+        close(fd)
+        player.reset()
+        log(senderActive.value ? "receiver gone" : "stopped")
     }
 }
 
@@ -977,15 +1230,42 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
         let volumes = VolumeSync(fd: client, lock: writeLock)
         volumes.start()
 
+        let clock = ClockSync()
+        let stop = AtomicBool(false)
+        Thread {
+            // Keep re-measuring: the estimate improves whenever a round trip
+            // happens to be quick, and a machine that sleeps needs it redone.
+            while !stop.value {
+                _ = sendUInt64s(client, .timeRequest, [nowNanos()], writeLock)
+                Thread.sleep(forTimeInterval: clock.settled ? 2 : 0.2)
+                clock.relax()
+            }
+        }.start()
+
         readFrames(client,
-                   onAudio: { samples, count in player.ring.write(samples, count) },
+                   onAudio: { playTime, samples, count in
+                       let position = player.ring.headPosition
+                       player.ring.write(samples, count)
+                       player.clockOffset.value = Int(clock.offsetNanos)
+                       player.schedule.set(position: position, playTime: playTime)
+                   },
                    onVolume: { volumes.applyRemote($0) },
                    onTarget: { ms in
                        log("target set to \(ms) ms by the sender")
                        player.setTarget(ms: ms)
+                   },
+                   onTimeRequest: { _ in },
+                   onTimeReply: { sentAt, remote in
+                       clock.sample(sent: sentAt, remote: remote, received: nowNanos())
                    })
+        stop.value = true
 
         volumes.stop()
+        // Go silent the moment the sender leaves. Without this the buffer keeps
+        // being played out and then replayed, which on the receiving Mac is a
+        // loop of noise that outlives the app you pressed stop in — and that
+        // machine may not be the one you are sitting at.
+        player.reset()
         log("sender disconnected")
         close(client)
     }

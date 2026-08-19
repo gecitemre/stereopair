@@ -20,8 +20,10 @@ final class Menu: NSObject, NSMenuDelegate {
 
     private var receiver: Process?
     private var sender: Process?
+    private let discovery = LiveDiscovery()
     private var peers: [Peer] = []
     private var sendingTo: String?
+    private var sentTo: String?
 
     private var executable: URL {
         Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/stereopair")
@@ -62,6 +64,7 @@ final class Menu: NSObject, NSMenuDelegate {
 
         // Always listen, so the other Mac can start the pair from its side too.
         startReceiver()
+        discovery.start()
         refreshPeers()
         refresh()
     }
@@ -88,39 +91,48 @@ final class Menu: NSObject, NSMenuDelegate {
     }
 
     @objc private func stopSending() {
-        sender?.terminate()
-        sender = nil
+        // SIGUSR1 rather than terminate: the sender keeps its audio tap alive
+        // between sessions. Creating one per session is what wedges coreaudiod
+        // until it is killed, and a stopped tap mutes nothing.
+        if let process = sender, process.isRunning {
+            kill(process.processIdentifier, SIGUSR1)
+        }
         sendingTo = nil
-        // The receiver holds the port, so it has to stand aside while we send
-        // and come back afterwards.
         startReceiver()
         refresh()
     }
 
     @objc private func sendToPeer(_ item: NSMenuItem) {
         guard let peer = peers.first(where: { $0.name == item.title }) else { return }
+        sendingTo = peer.name
+
+        // Reuse a sender already pointed at this Mac: it holds the audio tap,
+        // and creating a tap per session is what wedges coreaudiod.
+        if let process = sender, process.isRunning, sentTo == peer.name {
+            kill(process.processIdentifier, SIGUSR2)
+            refresh()
+            return
+        }
+
         sender?.terminate()
         // Sending and receiving at once would fight over this Mac's speakers.
         receiver?.terminate()
         receiver = nil
 
-        let address = preferredOrder(peer.addresses).first ?? ""
-        sender = spawn(["--send", address, "--target-ms", "auto",
-                        "--log", logPath("sender")])
-        sendingTo = peer.name
+        // Name, not address: choosing one here would skip the sender's own
+        // check that the address it connected on actually leaves through the
+        // Thunderbolt bridge.
+        sender = spawn(["--send", "auto", "--peer-name", peer.name,
+                        "--target-ms", "auto", "--log", logPath("sender")])
+        sentTo = peer.name
         refresh()
     }
 
     // MARK: - State
 
     private func refreshPeers() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let found = Discovery().search(timeout: 2)
-            DispatchQueue.main.async {
-                self.peers = found
-                self.rebuildSendMenu()
-            }
-        }
+        peers = discovery.peers
+        rebuildSendMenu()
     }
 
     private func rebuildSendMenu() {
@@ -140,7 +152,7 @@ final class Menu: NSObject, NSMenuDelegate {
         }
     }
 
-    private var isSending: Bool { sender?.isRunning == true }
+    private var isSending: Bool { sender?.isRunning == true && sendingTo != nil }
 
     private func refresh() {
         if isSending, let name = sendingTo {
