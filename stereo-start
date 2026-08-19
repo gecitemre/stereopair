@@ -66,8 +66,14 @@ start_sender() {
 	rm -f "$RUN/stereopair.log"
 	open -n bin/StereoPair.app --args --send "$PEER_IP" \
 		--target-ms "$TARGET_MS" --io-frames "$IO_FRAMES" --log "$RUN/stereopair.log"
-	sleep 2
-	grep -q "tapping" "$RUN/stereopair.log" 2>/dev/null
+	# Poll rather than sleep a fixed amount: creating the tap can take several
+	# seconds, and a short fixed wait reports a working start as a failure.
+	for _ in $(seq 1 20); do
+		grep -q "tapping" "$RUN/stereopair.log" 2>/dev/null && return 0
+		grep -q "No route to host" "$RUN/stereopair.log" 2>/dev/null && return 1
+		sleep 0.5
+	done
+	return 1
 }
 
 # Rebuilding changes the ad-hoc signature, which macOS treats as a new identity:

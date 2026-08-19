@@ -8,10 +8,11 @@
 // buffer before playing, so they stay aligned: the network adds well under a
 // millisecond over a Thunderbolt link, which is nothing next to the target.
 //
-// Nothing here corrects for clock drift. Two machines' audio crystals differ by
-// a few ppm, so the receiver's buffer creeps until it is trimmed or runs dry —
-// a brief discontinuity every so often, not a failure. Correcting it properly
-// means resampling.
+// Clock drift is corrected by resampling. The two machines' audio crystals
+// differ — measured at 8.3 ppm here — so a receiver playing back at exactly its
+// own rate walks its buffer to empty and glitches every 40 minutes or so.
+// Playback runs at a ratio a few ppm off 1.0, adjusted by a slow loop on the
+// buffer level, which holds latency at the target indefinitely.
 
 import AudioToolbox
 import CoreAudio
@@ -116,6 +117,39 @@ final class Ring: @unchecked Sendable {
         tail.store(h - frames, ordering: .releasing)
     }
 
+    /// Reads `count` output samples while consuming `count * ratio` input
+    /// samples, interpolating between neighbours. Holding the ratio a few ppm
+    /// off 1.0 is what lets a receiver track a sender whose audio clock runs at
+    /// a slightly different rate; without it the buffer walks to empty and
+    /// glitches, measured here at 8.3 ppm, about once every 40 minutes.
+    func readResampled(_ destination: UnsafeMutablePointer<Int16>, _ count: Int,
+                       ratio: Double, phase: inout Double) -> Bool
+    {
+        let t = tail.load(ordering: .relaxed)
+        let available = head.load(ordering: .acquiring) - t
+        // One extra for the interpolation's right-hand neighbour.
+        let needed = Int(phase + ratio * Double(count)) + 2
+        guard available >= needed else {
+            underruns.add(count, ordering: .relaxed)
+            return false
+        }
+
+        var cursor = phase
+        for i in 0 ..< count {
+            let index = Int(cursor)
+            let fraction = cursor - Double(index)
+            let a = Double(storage[(t + index) & mask])
+            let b = Double(storage[(t + index + 1) & mask])
+            destination[i] = Int16((a + (b - a) * fraction).rounded())
+            cursor += ratio
+        }
+
+        let consumed = Int(cursor)
+        tail.store(t + consumed, ordering: .releasing)
+        phase = cursor - Double(consumed)
+        return true
+    }
+
     func read(_ destination: UnsafeMutablePointer<Int16>, _ count: Int) -> Int {
         let t = tail.load(ordering: .relaxed)
         let n = min(count, head.load(ordering: .acquiring) - t)
@@ -145,6 +179,12 @@ final class Player {
 
         let ring = self.ring
         let primed = Atomic<Bool>(false)
+        // Playback rate, nudged towards whatever keeps the buffer at target.
+        // Bounded well under a tenth of a percent, far below audible pitch
+        // change, and the loop is deliberately slow so it tracks clock drift
+        // rather than chasing normal jitter.
+        nonisolated(unsafe) var ratio = 1.0
+        nonisolated(unsafe) var phase = 0.0
 
         let status = AudioDeviceCreateIOProcIDWithBlock(&procID, device, nil) { _, _, _, outputData, _ in
             let buffers = UnsafeMutableAudioBufferListPointer(outputData)
@@ -158,13 +198,17 @@ final class Player {
                 return
             }
 
+            // A burst still needs discarding; the rate loop only handles slow drift.
             if ring.fill > targetFrames * 3 { ring.trim(to: targetFrames) }
+
+            let error = Double(ring.fill - targetFrames) / Double(targetFrames)
+            let target = 1.0 + max(-0.0008, min(0.0008, error * 0.0008))
+            ratio += (target - ratio) * 0.02
 
             let scratch = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
             defer { scratch.deallocate() }
-            let got = ring.read(scratch, frames)
-            if got < frames {
-                scratch.advanced(by: got).update(repeating: 0, count: frames - got)
+            if !ring.readResampled(scratch, frames, ratio: ratio, phase: &phase) {
+                scratch.update(repeating: 0, count: frames)
             }
 
             for buffer in buffers {

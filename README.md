@@ -103,10 +103,13 @@ stereo is up over thunderbolt, 20ms target
 Pin `IFACE=bridge0` or `IFACE=en0` in `config.local.sh` to decide yourself. ssh
 can stay on Wi-Fi either way; only the audio follows `IFACE`.
 
-**Nothing corrects for clock drift.** The two machines' audio crystals differ by
-a few ppm, so the receiver's buffer creeps until it is trimmed or briefly runs
-dry — a short discontinuity now and then, not a failure. Over six minutes of
-continuous audio it did not happen once. Fixing it properly means resampling.
+**Clock drift is corrected by resampling.** The two machines' audio crystals
+differ — measured at **8.3 ppm** on this pair, over 2.7 hours of continuous
+audio — so a receiver playing at exactly its own rate walks its buffer to empty
+and glitches roughly every 40 minutes. Playback therefore runs at a ratio a few
+ppm off 1.0, adjusted by a slow loop on the buffer level, bounded to 0.08%: far
+below audible pitch change, and slow enough to track drift rather than chase
+jitter. Bursts are still discarded outright; the loop only handles slow drift.
 
 An earlier version of this used snapcast, which does handle drift, at 350–500 ms
 of buffer and ~515 ms end to end. Its client could not schedule playback sooner
