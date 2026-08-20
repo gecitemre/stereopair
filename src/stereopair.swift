@@ -1455,8 +1455,11 @@ func runSelfTest(seconds: Double) -> Never {
     installTeardownHandlers()
     let left = Ring(frames: 1 << 16)
     let right = Ring(frames: 1 << 16)
-    liveTap = Tap(left: left, right: right, muteBehavior: .unmuted)
+    let tap = Tap(left: left, right: right, muteBehavior: .unmuted)
+    liveTap = tap
+    tap.startCapture()
     Thread.sleep(forTimeInterval: seconds)
+    tap.stopCapture()
 
     var peak = 0
     let scratch = UnsafeMutablePointer<Int16>.allocate(capacity: 4096)
