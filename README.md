@@ -123,8 +123,20 @@ holds ~1 ms.
 
 Buffer size is a separate matter from sync: it only decides whether the audio
 has arrived by the time its schedule comes due. At 150 ms over Wi-Fi the sync
-was right and the sound still broke up, which is why the wireless buffer is
-300 ms.
+was right and the sound still broke up, which is why the wireless buffer starts
+at 300 ms.
+
+**It also adapts.** The receiver watches how much time each chunk has to spare
+before it is due. If that margin runs out it takes on extra delay immediately —
+the alternative is a dropout — and gives it back at 10 ms per 20 s once the link
+has been comfortable for a while. Growing fast and shrinking slowly is
+deliberate: reclaimed latency is worth nothing if finding out costs a dropout.
+
+Any extra delay is applied on *both* machines. Delaying only the receiver would
+turn a dropout into a channel offset of exactly the amount taken — 302 ms in the
+first version of this — and the logged timing error would still read zero,
+because it is measured against the shifted schedule. Ears caught that one, not
+the numbers.
 
 Errors under 100 ms are corrected by playing fractionally faster or slower,
 bounded to 0.08% and inaudible. Past that it steps, with a cooldown: a reconnect

@@ -293,6 +293,11 @@ final class Player {
     /// How far playback is from where the schedule says it should be. This, not
     /// the buffer level, is what tells you whether the two Macs agree.
     let timingErrorMicros = AtomicInt(0)
+    /// Extra delay the receiver has taken on to stay ahead of a bursty link.
+    /// Grows quickly when audio starts arriving late, shrinks slowly when it
+    /// stops, so a single bad minute does not cost latency for the rest of the
+    /// session and a worsening link does not cost dropouts.
+    let extraDelayMicros = AtomicInt(0)
     /// The sender picks this once it knows which link it got, so the receiver
     /// has to be able to change it after the fact.
     let target = AtomicInt(0)
@@ -322,6 +327,7 @@ final class Player {
         let schedule = self.schedule
         let offsetBox = self.clockOffset
         let errorBox = self.timingErrorMicros
+        let extraBox = self.extraDelayMicros
         let lastSeek = AtomicUInt64(0)
         let status = AudioDeviceCreateIOProcIDWithBlock(&procID, device, nil) { _, _, _, outputData, outputTime in
             let buffers = UnsafeMutableAudioBufferListPointer(outputData)
@@ -331,18 +337,28 @@ final class Player {
 
             let targetFrames = target.value
 
-            if !primed.value {
-                if ring.fill >= targetFrames { primed.value = true }
-                for buffer in buffers { memset(buffer.mData, 0, Int(buffer.mDataByteSize)) }
-                return
-            }
-
             // When this buffer will actually reach the speakers, expressed in
             // the sender's clock. Core Audio hands us that time; using it is
             // what makes playback independent of when packets turned up.
             let hostNanos = hostToNanos(outputTime.pointee.mHostTime)
             let senderNow = UInt64(bitPattern: Int64(bitPattern: hostNanos)
-                + Int64(offsetBox.value))
+                + Int64(offsetBox.value) - Int64(extraBox.value) * 1_000)
+
+            if !primed.value {
+                if ring.fill >= targetFrames {
+                    primed.value = true
+                    // Start where the schedule says, not wherever the buffer
+                    // happened to fill to. Otherwise playback begins tens of
+                    // milliseconds out and spends a minute and a half slewing
+                    // back at 0.08% — audible the whole way as the channels
+                    // slowly converging.
+                    if let wanted = schedule.position(at: senderNow) {
+                        ring.seek(to: wanted)
+                    }
+                }
+                for buffer in buffers { memset(buffer.mData, 0, Int(buffer.mDataByteSize)) }
+                return
+            }
 
             var timingError = 0.0
             if let wanted = schedule.position(at: senderNow) {
@@ -356,8 +372,15 @@ final class Player {
                 // machine waking. Anything smaller is left to the rate loop,
                 // because a step is audible and a slew is not. The cooldown
                 // stops a wrong estimate turning into a stream of skips.
+                // Ahead of schedule — which is what taking on extra delay looks
+                // like from in here. Hold by playing silence rather than
+                // skipping, and the schedule catches up on its own.
+                if drift < -frames {
+                    for buffer in buffers { memset(buffer.mData, 0, Int(buffer.mDataByteSize)) }
+                    return
+                }
                 let now = nowNanos()
-                if abs(drift) > sampleRate / 10, now &- lastSeek.value > 2_000_000_000 {
+                if drift > sampleRate / 10, now &- lastSeek.value > 2_000_000_000 {
                     ring.seek(to: wanted)
                     lastSeek.value = now
                     timingError = 0
@@ -561,6 +584,7 @@ enum Frame: UInt8 {
     case target = 2       // UInt32 ms; the sender decides once it knows the link
     case timeRequest = 3  // UInt64 receiver clock
     case timeReply = 4    // UInt64 echo + UInt64 sender clock
+    case delay = 5        // UInt32 ms of extra delay the receiver has taken on
 }
 
 /// A monotonic clock in nanoseconds, shared by everything that has to agree on
@@ -671,7 +695,8 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
                 onVolume: (Float) -> Void,
                 onTarget: (Int) -> Void = { _ in },
                 onTimeRequest: (UInt64) -> Void = { _ in },
-                onTimeReply: (UInt64, UInt64) -> Void = { _, _ in })
+                onTimeReply: (UInt64, UInt64) -> Void = { _, _ in },
+                onDelay: (Int) -> Void = { _ in })
 {
     var header = [UInt8](repeating: 0, count: 5)
     var payload = [UInt8](repeating: 0, count: 1 << 16)
@@ -696,6 +721,11 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
         case .target:
             let ms = payload.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
             onTarget(Int(UInt32(bigEndian: ms)))
+        case .delay:
+            guard length >= 4 else { return }
+            let ms = (UInt32(payload[0]) << 24) | (UInt32(payload[1]) << 16)
+                | (UInt32(payload[2]) << 8) | UInt32(payload[3])
+            onDelay(Int(ms))
         case .timeRequest:
             guard length >= 8 else { return }
             onTimeRequest(readUInt64(payload, 0))
@@ -1044,12 +1074,74 @@ func startStatsThread(_ label: String, _ player: Player) {
     Thread {
         while true {
             Thread.sleep(forTimeInterval: 10)
+            let extra = player.extraDelayMicros.value / 1000
             log("\(label) buffer \(ring.fill * 1000 / sampleRate) ms, "
                 + "offset \(player.timingErrorMicros.value / 1000) ms, "
+                + (extra > 0 ? "extra \(extra) ms, " : "")
                 + "underruns \(ring.underruns.load(ordering: .relaxed)), "
                 + "trimmed \(ring.trimmed.load(ordering: .relaxed))")
         }
     }.start()
+}
+
+/// Watches how much time each chunk has left before it is due, and buys more
+/// delay when that margin runs out. Growing is prompt because the alternative
+/// is a dropout; shrinking is slow because reclaiming latency is worth nothing
+/// if it costs a dropout to find out the link is still bad.
+final class Margin: @unchecked Sendable {
+    private let lock = NSLock()
+    private var worst = Int64.max
+    private var lastGrow = nowNanos()
+    private var lastShrink = nowNanos()
+
+    /// Never let audio arrive with less than this to spare.
+    private let floorNanos: Int64 = 40_000_000
+    /// Only give delay back when there is this much slack to lose.
+    private let comfortableNanos: Int64 = 200_000_000
+    private let ceilingMicros = 1_000_000
+
+    /// Extra delay has to be applied on both machines or it becomes a channel
+    /// offset: the receiver would hold back while the sender kept playing, and
+    /// the very sync this exists to protect would be broken by protecting it.
+    func observe(marginNanos: Int64, player: Player, announce: (Int) -> Void) {
+        lock.lock()
+        worst = min(worst, marginNanos)
+        let now = nowNanos()
+
+        if worst < floorNanos, now &- lastGrow > 1_000_000_000 {
+            let shortfall = floorNanos - worst
+            let grown = player.extraDelayMicros.value + Int(shortfall / 1_000) + 20_000
+            player.extraDelayMicros.value = min(grown, ceilingMicros)
+            lastGrow = now
+            lastShrink = now
+            worst = .max
+            let ms = player.extraDelayMicros.value / 1000
+            lock.unlock()
+            announce(ms)
+            log("link got worse; holding \(ms) ms extra")
+            return
+        }
+
+        if worst > comfortableNanos, player.extraDelayMicros.value > 0,
+           now &- lastShrink > 20_000_000_000
+        {
+            player.extraDelayMicros.value = max(0, player.extraDelayMicros.value - 10_000)
+            lastShrink = now
+            worst = .max
+            let ms = player.extraDelayMicros.value / 1000
+            lock.unlock()
+            announce(ms)
+            lock.lock()
+        }
+
+        // Forget slowly, so one quiet stretch cannot mask a link that is bad
+        // most of the time.
+        if now &- lastGrow > 10_000_000_000, now &- lastShrink > 10_000_000_000 {
+            worst = .max
+            lastShrink = now
+        }
+        lock.unlock()
+    }
 }
 
 // MARK: - Modes
@@ -1181,6 +1273,13 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
                            // Reply with our clock so the receiver can work out
                            // the offset between the two machines.
                            _ = sendUInt64s(fd, .timeReply, [asked, nowNanos()], writeLock)
+                       },
+                       onTimeReply: { _, _ in },
+                       onDelay: { ms in
+                           // Match the receiver's extra delay exactly, or the
+                           // two channels drift apart by however much it took.
+                           player.extraDelayMicros.value = ms * 1000
+                           log("matching receiver's extra delay: \(ms) ms")
                        })
             alive.value = false
         }.start()
@@ -1288,6 +1387,7 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
         volumes.start()
 
         let clock = ClockSync()
+        let margin = Margin()
         let stop = AtomicBool(false)
         Thread {
             // Keep re-measuring: the estimate improves whenever a round trip
@@ -1306,6 +1406,20 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                        player.ring.write(samples, count)
                        player.clockOffset.value = Int(clock.offsetNanos)
                        player.schedule.set(position: position, playTime: playTime)
+
+                       // How long this chunk has before it is due to be heard.
+                       // Negative means it arrived too late to be of use.
+                       let dueLocally = Int64(bitPattern: playTime) - clock.offsetNanos
+                           + Int64(player.extraDelayMicros.value) * 1_000
+                       margin.observe(marginNanos: dueLocally - Int64(bitPattern: nowNanos()),
+                                      player: player,
+                                      announce: { ms in
+                                          var value = UInt32(ms).bigEndian
+                                          _ = withUnsafeBytes(of: &value) {
+                                              sendFrame(client, .delay, $0.baseAddress!,
+                                                        $0.count, writeLock)
+                                          }
+                                      })
                    },
                    onVolume: { volumes.applyRemote($0) },
                    onTarget: { ms in
