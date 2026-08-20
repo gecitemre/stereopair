@@ -441,16 +441,312 @@ nonisolated(unsafe) var tapLayoutReports = 0
 
 // MARK: - Tap
 
+/// A Schroeder reverb in the Freeverb arrangement: eight comb filters in
+/// parallel feeding four allpasses in series, per channel, with the right
+/// channel's delays offset so the two sides decorrelate. Room size is purely
+/// how much each comb feeds back, so both rooms share one set of buffers and
+/// switching between them allocates nothing.
+///
+/// Buffers are raw pointers allocated once. Nothing here may allocate, lock or
+/// retain: it runs inside the tap's IOProc, where a missed deadline is a click.
+final class Reverb: @unchecked Sendable {
+    private struct Comb {
+        var buffer: UnsafeMutablePointer<Float>
+        var size: Int
+        var index = 0
+        var store: Float = 0
+
+        @inline(__always) mutating func process(_ input: Float, _ feedback: Float,
+                                                _ damp: Float) -> Float
+        {
+            let output = buffer[index]
+            store = output * (1 - damp) + store * damp
+            buffer[index] = input + store * feedback
+            index += 1
+            if index >= size { index = 0 }
+            return output
+        }
+    }
+
+    private struct Allpass {
+        var buffer: UnsafeMutablePointer<Float>
+        var size: Int
+        var index = 0
+
+        @inline(__always) mutating func process(_ input: Float) -> Float {
+            let held = buffer[index]
+            buffer[index] = input + held * 0.5
+            index += 1
+            if index >= size { index = 0 }
+            return -input + held
+        }
+    }
+
+    // Freeverb's tunings, at its original 44.1 kHz. Scaled on the way in.
+    private static let combTunings = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617]
+    private static let allpassTunings = [556, 441, 341, 225]
+    private static let spread = 23
+
+    private var combs: [Comb] = []
+    private var allpasses: [Allpass] = []
+
+    private let sizeBits = AtomicInt(0)
+    private let dampBits = AtomicInt(0)
+    private let mixBits = AtomicInt(0)
+
+    private var feedback: Float = 0
+    private var damp: Float = 0
+    private var wet: Float = 0
+    private var dry: Float = 1
+
+    init() {
+        let scale = Double(sampleRate) / 44100
+        for offset in [0, Reverb.spread] {
+            for tuning in Reverb.combTunings {
+                let size = Int(Double(tuning) * scale) + offset
+                let buffer = UnsafeMutablePointer<Float>.allocate(capacity: size)
+                buffer.initialize(repeating: 0, count: size)
+                combs.append(Comb(buffer: buffer, size: size))
+            }
+            for tuning in Reverb.allpassTunings {
+                let size = Int(Double(tuning) * scale) + offset
+                let buffer = UnsafeMutablePointer<Float>.allocate(capacity: size)
+                buffer.initialize(repeating: 0, count: size)
+                allpasses.append(Allpass(buffer: buffer, size: size))
+            }
+        }
+    }
+
+    /// `size` and `damp` run 0…1; `mix` is how much of the result is heard.
+    func set(size: Float, damp: Float, mix: Float) {
+        sizeBits.value = Int(size.bitPattern)
+        dampBits.value = Int(damp.bitPattern)
+        mixBits.value = Int(mix.bitPattern)
+    }
+
+    /// Read the settings once per buffer rather than per sample, so a change
+    /// landing mid-buffer cannot take effect halfway through one.
+    func beginBuffer() {
+        let size = Float(bitPattern: UInt32(sizeBits.value))
+        feedback = size * 0.28 + 0.7
+        damp = Float(bitPattern: UInt32(dampBits.value)) * 0.4
+        let mix = Float(bitPattern: UInt32(mixBits.value))
+        // Crossfade rather than add. The tail of a reverb can reach the level
+        // of what fed it, so mixing it on top of an untouched dry signal is how
+        // an effect ends up louder than the music.
+        wet = mix * wetScale
+        dry = 1 - mix
+    }
+
+    private let wetScale: Float = 1.0
+
+    /// Reverb adds energy — that is what it is for — so unlike width and
+    /// rotation it cannot promise never to raise the level. What it can promise
+    /// is a hard bound. A comb filter resonates, and a note sustained on one of
+    /// those resonances measured 7× the input before this: 17 dB, arriving
+    /// gradually, which is exactly the shape of thing that hurts.
+    ///
+    /// Everything below the threshold passes untouched, so ordinary material is
+    /// unaffected; above it the excess is bent smoothly into the last fifth,
+    /// and the output cannot reach full scale however hard it is driven.
+    @inline(__always) private func soften(_ x: Float) -> Float {
+        let threshold: Float = 0.8
+        let magnitude = abs(x)
+        guard magnitude > threshold else { return x }
+        let bent = threshold + (1 - threshold) * tanh((magnitude - threshold) / (1 - threshold))
+        return x < 0 ? -bent : bent
+    }
+
+    @inline(__always) func process(_ a: inout Float, _ b: inout Float) {
+        let input = (a + b) * 0.015
+        var left: Float = 0
+        var right: Float = 0
+        for i in 0 ..< 8 { left += combs[i].process(input, feedback, damp) }
+        for i in 8 ..< 16 { right += combs[i].process(input, feedback, damp) }
+        for i in 0 ..< 4 { left = allpasses[i].process(left) }
+        for i in 4 ..< 8 { right = allpasses[i].process(right) }
+        a = soften(a * dry + left * wet)
+        b = soften(b * dry + right * wet)
+    }
+
+    func clear() {
+        for comb in combs { comb.buffer.update(repeating: 0, count: comb.size) }
+        for allpass in allpasses { allpass.buffer.update(repeating: 0, count: allpass.size) }
+    }
+}
+
+/// Off, a small room, and a hall. Nothing between: a reverb control with a
+/// continuous size dial invites fiddling and this is a menu, not a plugin.
+enum Room: Int {
+    case off = 0, room = 1, hall = 2
+
+    var size: Float { self == .hall ? 0.9 : 0.5 }
+    var damp: Float { self == .hall ? 0.3 : 0.6 }
+    /// Deliberately restrained. On two laptop speakers a wet mix reads as
+    /// "broken" long before it reads as "concert".
+    var mix: Float { self == .hall ? 0.28 : 0.16 }
+    var name: String { self == .hall ? "Concert Hall" : self == .room ? "Room" : "Off" }
+}
+
+// MARK: - Effects
+
+/// Effects run on the sender, before the channels are split, so both machines
+/// receive material that has already been treated. Applying anything to one
+/// side alone would be a channel offset by another name — the exact failure
+/// this project spent days chasing.
+///
+/// No effect here may raise the output level. Both width and rotation have
+/// gains bounded at unity for that reason: widening and reverb-like processing
+/// both raise perceived loudness, and quiet listening is the point.
+struct EffectPass {
+    let midGain: Float
+    let sideGain: Float
+    let rotate: Bool
+    let step: Double
+    var phase: Double
+
+    /// How far rotation is allowed to close one side down. Full travel silences
+    /// a whole laptop once a cycle, which reads as a fault rather than an
+    /// effect; a tenth left open keeps it obviously alive.
+    private let depth: Float = 0.9
+
+    @inline(__always) mutating func apply(_ a: inout Float, _ b: inout Float) {
+        if midGain != 1 || sideGain != 1 {
+            let mid = (a + b) * 0.5 * midGain
+            let side = (a - b) * 0.5 * sideGain
+            a = mid + side
+            b = mid - side
+        }
+        if rotate {
+            phase += step
+            if phase > 2 * .pi { phase -= 2 * .pi }
+            let c = Float(cos(phase))
+            a *= 1 - depth * (1 - c) * 0.5
+            b *= 1 - depth * (1 + c) * 0.5
+        }
+    }
+}
+
+final class Effects: @unchecked Sendable {
+    /// Width as a percentage: 100 is untouched, below narrows towards mono,
+    /// above pushes the sides out.
+    private let widthPercent = AtomicInt(100)
+    private let rotating = AtomicBool(false)
+    private let room = AtomicInt(Room.off.rawValue)
+    private let reverb = Reverb()
+    /// Only the tap's IOProc touches this, and there is exactly one of those.
+    private var phase: Double = 0
+
+    /// A file rather than a signal: the two usable ones already mean start and
+    /// stop, and a file survives the sender being restarted between sessions.
+    static var path: String {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/StereoPair")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("effects").path
+    }
+
+    static func write(widthPercent: Int, rotate: Bool, room: Room) {
+        try? "width=\(widthPercent)\nrotate=\(rotate ? 1 : 0)\nroom=\(room.rawValue)\n"
+            .write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    static func read() -> (widthPercent: Int, rotate: Bool, room: Room) {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return (100, false, .off)
+        }
+        var width = 100
+        var rotate = false
+        var room = Room.off
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            switch parts[0] {
+            case "width": width = Int(parts[1]) ?? 100
+            case "rotate": rotate = parts[1] == "1"
+            case "room": room = Room(rawValue: Int(parts[1]) ?? 0) ?? .off
+            default: break
+            }
+        }
+        return (width, rotate, room)
+    }
+
+    /// Polled rather than watched: a quarter of a second is imperceptible for a
+    /// menu toggle, and it costs one stat() per tick.
+    func startWatching() {
+        Thread {
+            var last = ""
+            while true {
+                let current = (try? String(contentsOfFile: Effects.path, encoding: .utf8)) ?? ""
+                if current != last {
+                    last = current
+                    let settings = Effects.read()
+                    self.widthPercent.value = max(0, min(200, settings.widthPercent))
+                    self.rotating.value = settings.rotate
+                    // Clear before switching on, or the previous room's tail
+                    // decays into the new one.
+                    if self.room.value != settings.room.rawValue { self.reverb.clear() }
+                    self.room.value = settings.room.rawValue
+                    self.reverb.set(size: settings.room.size,
+                                    damp: settings.room.damp,
+                                    mix: settings.room == .off ? 0 : settings.room.mix)
+                    log("effects: width \(settings.widthPercent)%"
+                        + (settings.rotate ? ", rotating" : "")
+                        + (settings.room == .off ? "" : ", \(settings.room.name.lowercased())"))
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }.start()
+    }
+
+    var isIdle: Bool {
+        widthPercent.value == 100 && !rotating.value && room.value == Room.off.rawValue
+    }
+
+    /// nil when the reverb is off, so the hot loop pays nothing for it.
+    var activeReverb: Reverb? {
+        guard room.value != Room.off.rawValue else { return nil }
+        reverb.beginBuffer()
+        return reverb
+    }
+
+    func begin() -> EffectPass {
+        // Widen by cutting the middle, never by boosting the sides. Since
+        // |mid| + |side| is exactly the larger input sample, attenuating either
+        // one guarantees the output cannot exceed what came in — whereas
+        // boosting the sides and normalising afterwards lets out-of-phase
+        // material through 23% louder, which a level test caught.
+        let width = Float(widthPercent.value) / 100
+        return EffectPass(midGain: width > 1 ? 1 / width : 1,
+                          sideGain: width < 1 ? width : 1,
+                          rotate: rotating.value,
+                          step: 2 * .pi / (rotationSeconds * Double(sampleRate)),
+                          phase: phase)
+    }
+
+    func end(_ pass: EffectPass) { phase = pass.phase }
+}
+
+/// One turn every twelve seconds. Faster reads as a tremolo, slower stops
+/// registering as movement at all.
+let rotationSeconds = 12.0
+
 /// Taps everything except this process. Excluding ourselves matters twice: our
 /// own left-channel playback would otherwise be captured straight back into the
 /// stream, and `mutedWhenTapped` would silence it at the speakers.
 final class Tap {
+    let effects: Effects
     private(set) var tapID = AudioObjectID(kAudioObjectUnknown)
     private(set) var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private let uuid = UUID()
 
     init(left: Ring, right: Ring, muteBehavior: CATapMuteBehavior = .mutedWhenTapped) {
+        // Held locally as well: the IOProc block below cannot reach through
+        // self, which is not fully formed while init is still running.
+        let effects = Effects()
+        self.effects = effects
+
         let output = defaultOutputDevice()
         let outputUID = deviceUID(output)
 
@@ -525,7 +821,19 @@ final class Tap {
                 let l = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
                 let r = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
                 defer { l.deallocate(); r.deallocate() }
-                for i in 0 ..< frames { l[i] = pcm(base[i]); r[i] = pcm(second[i]) }
+                if effects.isIdle {
+                    for i in 0 ..< frames { l[i] = pcm(base[i]); r[i] = pcm(second[i]) }
+                } else {
+                    var pass = effects.begin()
+                    let reverb = effects.activeReverb
+                    for i in 0 ..< frames {
+                        var a = base[i], b = second[i]
+                        pass.apply(&a, &b)
+                        reverb?.process(&a, &b)
+                        l[i] = pcm(a); r[i] = pcm(b)
+                    }
+                    effects.end(pass)
+                }
                 left.write(l, frames)
                 right.write(r, frames)
             } else {
@@ -534,10 +842,19 @@ final class Tap {
                 let l = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
                 let r = UnsafeMutablePointer<Int16>.allocate(capacity: frames)
                 defer { l.deallocate(); r.deallocate() }
+                let other = channels >= 2 ? 1 : 0
+                var pass = effects.begin()
+                let idle = effects.isIdle
+                let reverb = idle ? nil : effects.activeReverb
                 for i in 0 ..< frames {
-                    l[i] = pcm(base[i * channels])
-                    r[i] = pcm(base[i * channels + (channels >= 2 ? 1 : 0)])
+                    var a = base[i * channels], b = base[i * channels + other]
+                    if !idle {
+                        pass.apply(&a, &b)
+                        reverb?.process(&a, &b)
+                    }
+                    l[i] = pcm(a); r[i] = pcm(b)
                 }
+                if !idle { effects.end(pass) }
                 left.write(l, frames)
                 right.write(r, frames)
             }
@@ -1206,6 +1523,7 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
     let outbound = Ring(frames: 1 << 16)
     let tap = Tap(left: player.ring, right: outbound)
     liveTap = tap
+    tap.effects.startWatching()
     log("ready" + (startIdle ? " (idle)" : ""))
     startStatsThread("left", player)
 

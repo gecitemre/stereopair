@@ -17,6 +17,10 @@ final class Menu: NSObject, NSMenuDelegate {
     private let stopItem = NSMenuItem(title: "Stop", action: #selector(stopSending), keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin),
                                        keyEquivalent: "")
+    private let effectsMenu = NSMenu()
+    private var widthPercent = 100
+    private var rotating = false
+    private var room = Room.off
 
     private var receiver: Process?
     private var sender: Process?
@@ -49,6 +53,12 @@ final class Menu: NSObject, NSMenuDelegate {
         menu.addItem(sendItem)
         stopItem.target = self
         menu.addItem(stopItem)
+
+        let effectsItem = NSMenuItem(title: "Effects", action: nil, keyEquivalent: "")
+        effectsItem.submenu = effectsMenu
+        menu.addItem(effectsItem)
+        (widthPercent, rotating, room) = Effects.read()
+        buildEffectsMenu()
 
         menu.addItem(.separator())
         statusLine.isEnabled = false
@@ -126,6 +136,77 @@ final class Menu: NSObject, NSMenuDelegate {
                         "--target-ms", "auto", "--log", logPath("sender")])
         sentTo = peer.name
         refresh()
+    }
+
+    // MARK: - Effects
+
+    /// Wider than the speakers already sit is rarely what this setup needs:
+    /// two laptops a desk apart are further apart than any built-in pair, so
+    /// narrowing is offered as prominently as widening.
+    private static let widths: [(String, Int)] = [
+        ("Narrow", 60), ("Normal", 100), ("Wide", 160),
+    ]
+
+    private func buildEffectsMenu() {
+        effectsMenu.removeAllItems()
+
+        let header = NSMenuItem(title: "Stereo Width", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        effectsMenu.addItem(header)
+        for (name, percent) in Menu.widths {
+            let item = NSMenuItem(title: name, action: #selector(setWidth(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = percent
+            item.state = percent == widthPercent ? .on : .off
+            effectsMenu.addItem(item)
+        }
+
+        effectsMenu.addItem(.separator())
+        let rotate = NSMenuItem(title: "Rotate", action: #selector(toggleRotate),
+                                keyEquivalent: "")
+        rotate.target = self
+        rotate.state = rotating ? .on : .off
+        effectsMenu.addItem(rotate)
+
+        let note = NSMenuItem(title: "Sound circles the pair every 12s",
+                              action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        effectsMenu.addItem(note)
+
+        effectsMenu.addItem(.separator())
+        let reverbHeader = NSMenuItem(title: "Reverb", action: nil, keyEquivalent: "")
+        reverbHeader.isEnabled = false
+        effectsMenu.addItem(reverbHeader)
+        for choice in [Room.off, .room, .hall] {
+            let item = NSMenuItem(title: choice.name, action: #selector(setRoom(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.tag = choice.rawValue
+            item.state = choice == room ? .on : .off
+            effectsMenu.addItem(item)
+        }
+    }
+
+    /// Written to a file the sender polls, so a toggle survives the sender
+    /// being restarted between sessions and needs no live connection.
+    private func applyEffects() {
+        Effects.write(widthPercent: widthPercent, rotate: rotating, room: room)
+        buildEffectsMenu()
+    }
+
+    @objc private func setWidth(_ item: NSMenuItem) {
+        widthPercent = item.tag
+        applyEffects()
+    }
+
+    @objc private func setRoom(_ item: NSMenuItem) {
+        room = Room(rawValue: item.tag) ?? .off
+        applyEffects()
+    }
+
+    @objc private func toggleRotate() {
+        rotating.toggle()
+        applyEffects()
     }
 
     // MARK: - State

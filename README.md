@@ -22,6 +22,9 @@ from, click the menu bar item and pick the other Mac under **Play On**.
 L·R
 ├─ Play On  ▸  Emre's MacBook Pro (2)
 ├─ Stop
+├─ Effects  ▸  Narrow · Normal · Wide
+│              Rotate
+│              Off · Room · Concert Hall
 │  Left: this Mac · Right: Emre's MacBook Pro (2)
 ├─ Open at Login
 └─ Quit
@@ -192,6 +195,49 @@ that list, it has not requested access yet — start it, then reopen Settings.
 Note that an ad-hoc signature changes on every build, and macOS treats that as a
 new identity: the first connection after a rebuild is refused while it
 re-registers, and the next one succeeds.
+
+## Effects
+
+All optional, all off by default, and all applied on the sending Mac *before*
+the channels are split — anything applied to one side alone would be a channel
+offset by another name. They can be changed while playing; the settings live in
+a small file the sender polls, so they survive a restart and need no live
+connection.
+
+**Stereo width** works on mid and side rather than on left and right. Every
+stereo signal splits into what the two channels share (the middle — usually
+vocals, bass, kick) and what they differ by (the sides). *Narrow* attenuates the
+sides and pulls everything towards a single point between the machines; *Wide*
+attenuates the middle so what is common recedes and what differs stands out.
+
+Widening cuts the middle rather than boosting the sides on purpose. The first
+version did boost the sides and normalised afterwards, which a level test caught
+letting out-of-phase material through 23% louder. Since `|mid| + |side|` is
+exactly the larger of the two input samples, attenuating either one puts a hard
+ceiling on the output. The cost is that *Wide* is about 4 dB quieter on centred
+material — that is what widening means, and reaching for the volume knob to
+compensate defeats it.
+
+**Rotate** is the "8D audio" effect: a slow constant-power pan, one turn every
+twelve seconds. Be aware that the illusion of sound orbiting your head is a
+headphone effect and depends on your ears being isolated from each other; on two
+speakers it reads as movement from side to side. It never closes a channel down
+by more than 90%, because full travel silences a laptop once a cycle and that
+reads as a fault rather than an effect.
+
+**Reverb** is a Schroeder reverb in the Freeverb arrangement — eight comb
+filters in parallel into four allpasses in series, per channel, with the right
+channel's delays offset so the two sides decorrelate. Room size is only how much
+each comb feeds back, so both rooms share one set of buffers and switching
+allocates nothing.
+
+Unlike width and rotation, reverb cannot promise never to raise the level: it
+adds energy, which is what it is for. A comb filter resonates, and a note
+sustained on one of those resonances measured **7× the input** — 17 dB, arriving
+gradually, which is the shape of thing that hurts. So the output passes through
+a soft limiter: everything below 0.8 is untouched (with reverb off the signal is
+unchanged to the bit), and above that the excess bends into the last fifth.
+Swept from 20 Hz to 4 kHz the worst case is now 1.000.
 
 ## Placement
 
