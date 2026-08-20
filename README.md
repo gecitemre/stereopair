@@ -99,13 +99,15 @@ becomes excludable once it has one.
 |---|---|---|
 | ping jitter | 0.06 ms stddev | 28.8 ms stddev, 86 ms worst |
 | buffer | **20 ms** | **300 ms** |
-| end to end | **~32 ms** | ~310 ms |
+| end to end | **~32 ms** | ~310 ms, up to ~600 ms |
 | channel offset | ~1 ms | ~1 ms |
 
 A direct Thunderbolt cable is what makes the low figure possible: it cuts jitter
 ~490×. It needs no setup — macOS brings the bridge up by itself — but it must be
 a real Thunderbolt/USB4 cable, not a charging cable. At 32 ms video stays
-watchable; at 310 ms it does not, so over Wi-Fi this is for music.
+watchable; at 310 ms it does not, so over Wi-Fi this is for music. The Wi-Fi
+figure is a floor, not a fixed number — see the adaptive buffer below. On a bad
+link it has settled as high as 600 ms here.
 
 **Playback follows a schedule, not the buffer.** Each chunk carries the time it
 should be heard, in the sender's clock. The receiver works out the offset
@@ -219,10 +221,12 @@ is actually capturing.
 
 ## Not done
 
-- The Wi-Fi target of 150 ms is a guess. Only the Thunderbolt path is measured.
-- No notarised build has been produced yet, so nobody can install it without
-  building it.
-- Nobody but the author has installed it.
+- Nobody but the author has installed it, on the author's two machines and one
+  Wi-Fi network.
+- The buffer sizes itself from the worst chunk it has seen, so a single 260 ms
+  straggler buys permanent latency, and it is released at 10 ms per 20 s — ten
+  minutes to give back 300 ms.
+- Wi-Fi still drops the occasional burst. Rarer than it was, not gone.
 
 ## Licence
 
