@@ -620,10 +620,14 @@ final class ClockSync: @unchecked Sendable {
     private var applied: Int64 = 0
     private var started = false
 
+    /// One exchange is enough to have *an* estimate, not enough to trust it:
+    /// the whole method rests on catching a round trip that queueing missed,
+    /// which needs a few tries. Nothing that depends on the offset may run
+    /// before this is true.
     var settled: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return started
+        return window.count >= 8
     }
 
     var offsetNanos: Int64 {
@@ -1105,6 +1109,7 @@ final class Margin: @unchecked Sendable {
     /// Only give delay back when there is this much slack to lose.
     private let comfortableNanos: Int64 = 200_000_000
     private let ceilingMicros = 1_000_000
+    private let maxGrowthMicros = 150_000
 
     /// Extra delay has to be applied on both machines or it becomes a channel
     /// offset: the receiver would hold back while the sender kept playing, and
@@ -1116,8 +1121,12 @@ final class Margin: @unchecked Sendable {
 
         if worst < floorNanos, now &- lastGrow > 1_000_000_000 {
             let shortfall = floorNanos - worst
-            let grown = player.extraDelayMicros.value + Int(shortfall / 1_000) + 20_000
-            player.extraDelayMicros.value = min(grown, ceilingMicros)
+            // Step, don't leap. A single wrong reading that asks for a second
+            // of delay gets it if it keeps asking, but not on the strength of
+            // one sample — and latency is far cheaper to add than to give back.
+            let step = min(Int(shortfall / 1_000) + 20_000, maxGrowthMicros)
+            player.extraDelayMicros.value = min(player.extraDelayMicros.value + step,
+                                                ceilingMicros)
             lastGrow = now
             lastShrink = now
             worst = .max
@@ -1402,12 +1411,20 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                 _ = sendUInt64s(client, .timeRequest, [nowNanos()], writeLock)
                 // Fast at first so playback can start, then often enough to
                 // keep the window fresh without flooding the link.
-                Thread.sleep(forTimeInterval: clock.settled ? 1 : 0.15)
+                Thread.sleep(forTimeInterval: clock.settled ? 1 : 0.05)
             }
         }.start()
 
         readFrames(client,
                    onAudio: { playTime, samples, count in
+                       // Until the clock offset is measured it reads zero, and
+                       // every calculation below compares the sender's raw
+                       // clock against ours — a meaningless difference that
+                       // looks like an enormous shortfall. Dropping the first
+                       // fraction of a second costs nothing: playback has not
+                       // primed yet, so these frames would be silence anyway.
+                       guard clock.settled else { return }
+
                        let position = player.ring.headPosition
                        player.ring.write(samples, count)
                        player.clockOffset.value = Int(clock.offsetNanos)
