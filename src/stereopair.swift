@@ -420,6 +420,12 @@ final class Player {
     func reset() {
         ring.clear()
         primedFlag.value = false
+        // Extra delay belongs to a link, not to a machine. Carrying it into the
+        // next session puts the receiver behind by whatever the last one needed
+        // — the sender starts every session at zero, and only learns otherwise
+        // when the receiver announces a *change*. Both sides clear here, so a
+        // fresh session begins agreed and re-earns any delay it needs.
+        extraDelayMicros.value = 0
     }
 
     func stop() {
