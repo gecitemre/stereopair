@@ -124,6 +124,13 @@ func setSystemVolume(_ level: Float) {
 
 // MARK: - Ring buffer
 
+/// Four times the deepest buffer the adaptive delay can ask for. At 1 << 16 it
+/// was 1365 ms against a worst case of 1300 — the ring sat pinned at capacity,
+/// dropping every sample that would not fit, and the shortfall that caused
+/// looked to the adaptive logic like a failing link, so it asked for yet more
+/// delay. Headroom is what stops that from feeding itself.
+let ringFrames = 1 << 18
+
 final class Ring: @unchecked Sendable {
     private let capacity: Int
     private let mask: Int
@@ -132,6 +139,9 @@ final class Ring: @unchecked Sendable {
     private let tail = Atomic<Int>(0)
     let underruns = Atomic<Int>(0)
     let trimmed = Atomic<Int>(0)
+    /// Audio that would not fit. Silently discarding it is how a saturated ring
+    /// looks exactly like a healthy one from the outside.
+    let dropped = Atomic<Int>(0)
 
     init(frames: Int) {
         capacity = frames
@@ -146,6 +156,7 @@ final class Ring: @unchecked Sendable {
         let h = head.load(ordering: .relaxed)
         let room = capacity - (h - tail.load(ordering: .acquiring))
         let n = min(count, room)
+        if n < count { dropped.add(count - n, ordering: .relaxed) }
         for i in 0 ..< n { storage[(h + i) & mask] = source[i] }
         head.store(h + n, ordering: .releasing)
     }
@@ -286,7 +297,7 @@ final class Schedule: @unchecked Sendable {
 final class Player {
     private let device: AudioObjectID
     private var procID: AudioDeviceIOProcID?
-    let ring = Ring(frames: 1 << 16)
+    let ring = Ring(frames: ringFrames)
     let schedule = Schedule()
     /// Sender clock minus ours. Zero when the sender is this machine.
     let clockOffset = AtomicInt(0)
@@ -1402,11 +1413,14 @@ func startStatsThread(_ label: String, _ player: Player) {
         while true {
             Thread.sleep(forTimeInterval: 10)
             let extra = player.extraDelayMicros.value / 1000
-            log("\(label) buffer \(ring.fill * 1000 / sampleRate) ms, "
-                + "offset \(player.timingErrorMicros.value / 1000) ms, "
-                + (extra > 0 ? "extra \(extra) ms, " : "")
-                + "underruns \(ring.underruns.load(ordering: .relaxed)), "
-                + "trimmed \(ring.trimmed.load(ordering: .relaxed))")
+            let dropped = ring.dropped.load(ordering: .relaxed)
+            var line = "\(label) buffer \(ring.fill * 1000 / sampleRate) ms"
+            line += ", offset \(player.timingErrorMicros.value / 1000) ms"
+            if extra > 0 { line += ", extra \(extra) ms" }
+            line += ", underruns \(ring.underruns.load(ordering: .relaxed))"
+            if dropped > 0 { line += ", dropped \(dropped)" }
+            line += ", trimmed \(ring.trimmed.load(ordering: .relaxed))"
+            log(line)
         }
     }.start()
 }
@@ -1425,7 +1439,9 @@ final class Margin: @unchecked Sendable {
     private let floorNanos: Int64 = 40_000_000
     /// Only give delay back when there is this much slack to lose.
     private let comfortableNanos: Int64 = 200_000_000
-    private let ceilingMicros = 1_000_000
+    /// Bounded by the ring, not chosen freely: a delay the buffer cannot hold
+    /// is not a delay, it is dropped audio wearing one.
+    private let ceilingMicros = min(1_000_000, ringFrames * 1_000_000 / sampleRate / 4)
     private let maxGrowthMicros = 150_000
 
     /// Extra delay has to be applied on both machines or it becomes a channel
@@ -1520,7 +1536,7 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
                                                    : 20 * sampleRate / 1000,
                         ioFrames: ioFrames)
     livePlayer = player
-    let outbound = Ring(frames: 1 << 16)
+    let outbound = Ring(frames: ringFrames)
     let tap = Tap(left: player.ring, right: outbound)
     liveTap = tap
     tap.effects.startWatching()
@@ -1788,8 +1804,8 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
 /// silence — so the only honest check is to capture and look at the samples.
 func runSelfTest(seconds: Double) -> Never {
     installTeardownHandlers()
-    let left = Ring(frames: 1 << 16)
-    let right = Ring(frames: 1 << 16)
+    let left = Ring(frames: ringFrames)
+    let right = Ring(frames: ringFrames)
     let tap = Tap(left: left, right: right, muteBehavior: .unmuted)
     liveTap = tap
     tap.startCapture()
