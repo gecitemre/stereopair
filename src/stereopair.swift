@@ -1372,9 +1372,24 @@ func readAll(_ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ bytes: Int) -> Bo
 
 func writeAll(_ fd: Int32, _ buffer: UnsafeRawPointer, _ bytes: Int) -> Bool {
     var offset = 0
+    // The socket has a send timeout, so a link that stops draining surfaces as
+    // EAGAIN rather than an indefinite block. Half a frame cannot be abandoned
+    // — the far side would read the remainder as a header — so retry, but only
+    // for as long as a link could plausibly recover. Beyond that it is gone.
+    var stalls = 0
     while offset < bytes {
         let n = send(fd, buffer.advanced(by: offset), bytes - offset, 0)
-        if n > 0 { offset += n } else if n < 0 && errno == EINTR { continue } else { return false }
+        if n > 0 {
+            offset += n
+            stalls = 0
+        } else if n < 0 && errno == EINTR {
+            continue
+        } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+            stalls += 1
+            if stalls > 25 { return false }
+        } else {
+            return false
+        }
     }
     return true
 }
@@ -1434,6 +1449,8 @@ final class Margin: @unchecked Sendable {
     private var worst = Int64.max
     private var lastGrow = nowNanos()
     private var lastShrink = nowNanos()
+    private var lastReport = nowNanos()
+    private var worstSinceReport = Int64.max
 
     /// Never let audio arrive with less than this to spare.
     private let floorNanos: Int64 = 40_000_000
@@ -1450,7 +1467,22 @@ final class Margin: @unchecked Sendable {
     func observe(marginNanos: Int64, player: Player, announce: (Int) -> Void) {
         lock.lock()
         worst = min(worst, marginNanos)
+        worstSinceReport = min(worstSinceReport, marginNanos)
         let now = nowNanos()
+
+        // Say by how much, not just that. Three separate faults in this
+        // subsystem were each mistaken for the previous one because the log
+        // recorded the reaction and never the measurement behind it.
+        if now &- lastReport > 10_000_000_000 {
+            let ms = Double(worstSinceReport) / 1_000_000
+            let held = player.extraDelayMicros.value / 1000
+            worstSinceReport = .max
+            lastReport = now
+            lock.unlock()
+            log(String(format: "margin: worst %.0f ms over 10 s, holding %d ms extra",
+                       ms, held))
+            lock.lock()
+        }
 
         if worst < floorNanos, now &- lastGrow > 1_000_000_000 {
             let shortfall = floorNanos - worst
@@ -1458,15 +1490,21 @@ final class Margin: @unchecked Sendable {
             // of delay gets it if it keeps asking, but not on the strength of
             // one sample — and latency is far cheaper to add than to give back.
             let step = min(Int(shortfall / 1_000) + 20_000, maxGrowthMicros)
-            player.extraDelayMicros.value = min(player.extraDelayMicros.value + step,
-                                                ceilingMicros)
             lastGrow = now
             lastShrink = now
             worst = .max
+            let before = player.extraDelayMicros.value
+            player.extraDelayMicros.value = min(before + step, ceilingMicros)
             let ms = player.extraDelayMicros.value / 1000
             lock.unlock()
             announce(ms)
-            log("link got worse; holding \(ms) ms extra")
+            if player.extraDelayMicros.value == before {
+                log(String(format: "margin short by %.0f ms but already at the %d ms ceiling",
+                           Double(shortfall) / 1_000_000, ms))
+            } else {
+                log(String(format: "link got worse; short by %.0f ms, holding %d ms extra",
+                           Double(shortfall) / 1_000_000, ms))
+            }
             return
         }
 
@@ -1591,6 +1629,12 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
             continue
         }
         disableNagle(fd)
+        // Bound how long one write may block. Without this a link that stops
+        // draining stalls the loop indefinitely, and the stream falls behind
+        // real time by exactly that stall.
+        var timeout = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                   socklen_t(MemoryLayout<timeval>.size))
 
         let wired = ourBridge != nil && localAddress(of: fd) == ourBridge
         // Measured: at 150 ms over Wi-Fi the schedule regularly came due before the
@@ -1652,6 +1696,31 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         // *and* a chunk per capture is twice real time.
         while alive.value, senderActive.value {
             deadline &+= chunkNanos
+
+            // A blocking write on a stalled link stops this loop, and `sent`
+            // is what the schedule is built from — so every chunk emitted
+            // afterwards carries a play time from before the stall. Measured:
+            // ten seconds of accumulated stall put the stream ten seconds in
+            // the past, which no amount of extra delay at the far end can
+            // ever satisfy. Audio stamped for a moment already gone cannot be
+            // played on time by anyone, so skip it rather than send a backlog.
+            // Only once the stream is anchored. Advancing `sent` before then
+            // skips the `sent == 0` block that sets `start`, leaving it zero
+            // for the life of the session — every play time then reads as
+            // seconds since the stream began, against a receiver comparing it
+            // to a real clock. The gap is the sender's uptime, and no amount
+            // of buffering closes it.
+            let elapsed = DispatchTime.now().uptimeNanoseconds
+            if sent > 0, elapsed > deadline &+ chunkNanos {
+                let behind = Int((elapsed &- deadline) / chunkNanos)
+                let stale = behind * chunk
+                outbound.seek(to: outbound.tailPosition + stale)
+                sent += stale
+                deadline &+= UInt64(behind) &* chunkNanos
+                log("fell \(behind * Int(chunkNanos) / 1_000_000) ms behind; "
+                    + "skipping that much rather than sending it late")
+            }
+
             let position = outbound.tailPosition
             let got = outbound.read(buffer, chunk)
             if got < chunk {
