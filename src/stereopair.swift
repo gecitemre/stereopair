@@ -179,6 +179,7 @@ final class Ring: @unchecked Sendable {
         tail.store(head.load(ordering: .acquiring), ordering: .releasing)
         underruns.store(0, ordering: .releasing)
         trimmed.store(0, ordering: .releasing)
+        dropped.store(0, ordering: .releasing)
     }
 
     func trim(to frames: Int) {
@@ -1450,32 +1451,55 @@ final class Margin: @unchecked Sendable {
     private var lastGrow = nowNanos()
     private var lastShrink = nowNanos()
     private var lastReport = nowNanos()
+    private var lastFault = nowNanos()
     private var worstSinceReport = Int64.max
+
+    /// Beyond this, a shortfall is not a measurement of a slow link — it is a
+    /// fault. Every runaway this loop produced began by taking one seriously:
+    /// ten seconds from a stalled sender, thirty-nine hours from a schedule
+    /// anchored at zero. No buffer closes either, so growing towards them only
+    /// saturates the ceiling and hides the real problem behind added latency.
+    private let implausibleNanos: Int64 = 2_000_000_000
 
     /// Never let audio arrive with less than this to spare.
     private let floorNanos: Int64 = 40_000_000
     /// Only give delay back when there is this much slack to lose.
     private let comfortableNanos: Int64 = 200_000_000
-    /// Bounded by the ring, not chosen freely: a delay the buffer cannot hold
-    /// is not a delay, it is dropped audio wearing one.
-    private let ceilingMicros = min(1_000_000, ringFrames * 1_000_000 / sampleRate / 4)
+    /// Bounded twice. By the ring, because a delay the buffer cannot hold is
+    /// not a delay but dropped audio wearing one — and at 300 ms, because the
+    /// point of this is to survive a rough patch, not to keep buying latency
+    /// until the pair is a second and a half behind the music.
+    private let ceilingMicros = min(300_000, ringFrames * 1_000_000 / sampleRate / 4)
     private let maxGrowthMicros = 150_000
 
     /// Extra delay has to be applied on both machines or it becomes a channel
     /// offset: the receiver would hold back while the sender kept playing, and
     /// the very sync this exists to protect would be broken by protecting it.
-    func observe(marginNanos: Int64, player: Player, announce: (Int) -> Void) {
+    func observe(marginNanos: Int64, extra: AtomicInt, announce: (Int) -> Void) {
         lock.lock()
+        let now = nowNanos()
+
+        if marginNanos < -implausibleNanos {
+            let report = now &- lastFault > 10_000_000_000
+            if report { lastFault = now }
+            lock.unlock()
+            if report {
+                log(String(format: "fault: audio due %.1f s ago, which no buffer can fix — "
+                                 + "not treating this as a slow link",
+                           Double(-marginNanos) / 1_000_000_000))
+            }
+            return
+        }
+
         worst = min(worst, marginNanos)
         worstSinceReport = min(worstSinceReport, marginNanos)
-        let now = nowNanos()
 
         // Say by how much, not just that. Three separate faults in this
         // subsystem were each mistaken for the previous one because the log
         // recorded the reaction and never the measurement behind it.
         if now &- lastReport > 10_000_000_000 {
             let ms = Double(worstSinceReport) / 1_000_000
-            let held = player.extraDelayMicros.value / 1000
+            let held = extra.value / 1000
             worstSinceReport = .max
             lastReport = now
             lock.unlock()
@@ -1493,12 +1517,12 @@ final class Margin: @unchecked Sendable {
             lastGrow = now
             lastShrink = now
             worst = .max
-            let before = player.extraDelayMicros.value
-            player.extraDelayMicros.value = min(before + step, ceilingMicros)
-            let ms = player.extraDelayMicros.value / 1000
+            let before = extra.value
+            extra.value = min(before + step, ceilingMicros)
+            let ms = extra.value / 1000
             lock.unlock()
             announce(ms)
-            if player.extraDelayMicros.value == before {
+            if extra.value == before {
                 log(String(format: "margin short by %.0f ms but already at the %d ms ceiling",
                            Double(shortfall) / 1_000_000, ms))
             } else {
@@ -1508,13 +1532,13 @@ final class Margin: @unchecked Sendable {
             return
         }
 
-        if worst > comfortableNanos, player.extraDelayMicros.value > 0,
+        if worst > comfortableNanos, extra.value > 0,
            now &- lastShrink > 20_000_000_000
         {
-            player.extraDelayMicros.value = max(0, player.extraDelayMicros.value - 10_000)
+            extra.value = max(0, extra.value - 10_000)
             lastShrink = now
             worst = .max
-            let ms = player.extraDelayMicros.value / 1000
+            let ms = extra.value / 1000
             lock.unlock()
             announce(ms)
             lock.lock()
@@ -1646,6 +1670,12 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
 
         player.setTarget(ms: negotiated)
         player.reset()
+        // The schedule anchors on this ring's tail, so whatever it still holds
+        // becomes local playback delay: the player sits that far behind while
+        // reporting a timing error of zero, because it is exactly where the
+        // schedule told it to be. A stale ring meant five seconds behind the
+        // video and five seconds behind the other Mac.
+        outbound.clear()
 
         let writeLock = NSLock()
         var announced = UInt32(negotiated).bigEndian
@@ -1838,7 +1868,7 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                        let dueLocally = Int64(bitPattern: playTime) - clock.offsetNanos
                            + Int64(player.extraDelayMicros.value) * 1_000
                        margin.observe(marginNanos: dueLocally - Int64(bitPattern: nowNanos()),
-                                      player: player,
+                                      extra: player.extraDelayMicros,
                                       announce: { ms in
                                           var value = UInt32(ms).bigEndian
                                           _ = withUnsafeBytes(of: &value) {

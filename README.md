@@ -137,6 +137,17 @@ the alternative is a dropout — and gives it back at 10 ms per 20 s once the li
 has been comfortable for a while. Growing fast and shrinking slowly is
 deliberate: reclaimed latency is worth nothing if finding out costs a dropout.
 
+It is bounded twice. By 300 ms, so a rough patch costs a few hundred
+milliseconds rather than the second and a half an unbounded version reached; and
+by the ring, because a delay the buffer cannot hold is not a delay but dropped
+audio wearing one.
+
+It also refuses shortfalls larger than two seconds. Nothing a buffer holds can
+close a two-second gap, so a number that large is a fault — a schedule anchored
+wrong, a sender stalled on a blocking write — and every runaway this loop
+produced began by taking one seriously and growing towards it. Those are logged
+as faults now instead, which turns a mystery into a diagnosis.
+
 Any extra delay is applied on *both* machines. Delaying only the receiver would
 turn a dropout into a channel offset of exactly the amount taken — 302 ms in the
 first version of this — and the logged timing error would still read zero,
