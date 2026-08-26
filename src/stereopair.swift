@@ -142,6 +142,8 @@ final class Ring: @unchecked Sendable {
     /// Audio that would not fit. Silently discarding it is how a saturated ring
     /// looks exactly like a healthy one from the outside.
     let dropped = Atomic<Int>(0)
+    /// Audio that arrived after its position had already been played.
+    let late = Atomic<Int>(0)
 
     init(frames: Int) {
         capacity = frames
@@ -166,6 +168,31 @@ final class Ring: @unchecked Sendable {
     var tailPosition: Int { tail.load(ordering: .acquiring) }
     var headPosition: Int { head.load(ordering: .acquiring) }
 
+    /// Place samples at an absolute stream position, for a transport that does
+    /// not guarantee order or delivery. A lost packet leaves its gap zeroed —
+    /// a blink of silence — instead of holding up everything behind it, which
+    /// is the entire reason to use such a transport. Anything already played
+    /// is counted late and dropped.
+    func write(at position: Int, _ source: UnsafePointer<Int16>, _ count: Int) {
+        let h = head.load(ordering: .relaxed)
+        let t = tail.load(ordering: .acquiring)
+        var begin = position
+        var from = 0
+        let end = position + count
+        if end <= t { late.add(count, ordering: .relaxed); return }
+        if begin < t {
+            late.add(t - begin, ordering: .relaxed)
+            from = t - begin
+            begin = t
+        }
+        if end - t > capacity { dropped.add(count - from, ordering: .relaxed); return }
+        if begin > h {
+            for i in h ..< begin { storage[i & mask] = 0 }
+        }
+        for i in 0 ..< (end - begin) { storage[(begin + i) & mask] = source[from + i] }
+        if end > h { head.store(end, ordering: .releasing) }
+    }
+
     /// Jump straight to a position, clamped to what we actually hold.
     func seek(to position: Int) {
         let h = head.load(ordering: .acquiring)
@@ -180,6 +207,7 @@ final class Ring: @unchecked Sendable {
         underruns.store(0, ordering: .releasing)
         trimmed.store(0, ordering: .releasing)
         dropped.store(0, ordering: .releasing)
+        late.store(0, ordering: .releasing)
     }
 
     func trim(to frames: Int) {
@@ -920,6 +948,7 @@ enum Frame: UInt8 {
     case timeRequest = 3  // UInt64 receiver clock
     case timeReply = 4    // UInt64 echo + UInt64 sender clock
     case delay = 5        // UInt32 ms of extra delay the receiver has taken on
+    case udpReady = 6     // empty; the receiver accepts audio as datagrams
 }
 
 /// A monotonic clock in nanoseconds, shared by everything that has to agree on
@@ -948,6 +977,7 @@ final class ClockSync: @unchecked Sendable {
     private var window: [(roundTrip: UInt64, offset: Int64)] = []
     private var applied: Int64 = 0
     private var started = false
+    private var disagreeSince: UInt64 = 0
 
     /// One exchange is enough to have *an* estimate, not enough to trust it:
     /// the whole method rests on catching a round trip that queueing missed,
@@ -986,6 +1016,29 @@ final class ClockSync: @unchecked Sendable {
             started = true
             return
         }
+        // The slew below closes realistic errors within seconds — and a badly
+        // locked estimate never. An estimate locked during a congested session
+        // start measured 600 ms wrong; at 200 µs per exchange that takes fifty
+        // minutes to correct, and everything downstream inherits the error for
+        // the whole session: margins read hundreds of milliseconds short on a
+        // healthy link, and the adaptive buffer saturates trying to close a
+        // gap that is not in the network. So when quick exchanges — the only
+        // trustworthy kind — keep disagreeing with the estimate, step to them.
+        // One audible skip, against a channel offset that never goes away.
+        let disagreement = best.offset - applied
+        if best.roundTrip < 30_000_000, abs(disagreement) > 50_000_000 {
+            if disagreeSince == 0 {
+                disagreeSince = received
+            } else if received &- disagreeSince > 5_000_000_000 {
+                applied = best.offset
+                disagreeSince = 0
+                log("clock estimate was \(disagreement / 1_000_000) ms off; stepping to match")
+                return
+            }
+        } else {
+            disagreeSince = 0
+        }
+
         // Slew rather than jump: a step in the offset moves the whole schedule
         // and shows up as a skip. 200 microseconds per exchange closes a
         // realistic error within seconds and is far below audibility.
@@ -1035,7 +1088,8 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
                 onTarget: (Int) -> Void = { _ in },
                 onTimeRequest: (UInt64) -> Void = { _ in },
                 onTimeReply: (UInt64, UInt64) -> Void = { _, _ in },
-                onDelay: (Int) -> Void = { _ in })
+                onDelay: (Int) -> Void = { _ in },
+                onUdpReady: () -> Void = {})
 {
     var header = [UInt8](repeating: 0, count: 5)
     var payload = [UInt8](repeating: 0, count: 1 << 16)
@@ -1065,6 +1119,8 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
             let ms = (UInt32(payload[0]) << 24) | (UInt32(payload[1]) << 16)
                 | (UInt32(payload[2]) << 8) | UInt32(payload[3])
             onDelay(Int(ms))
+        case .udpReady:
+            onUdpReady()
         case .timeRequest:
             guard length >= 8 else { return }
             onTimeRequest(readUInt64(payload, 0))
@@ -1435,6 +1491,8 @@ func startStatsThread(_ label: String, _ player: Player) {
             if extra > 0 { line += ", extra \(extra) ms" }
             line += ", underruns \(ring.underruns.load(ordering: .relaxed))"
             if dropped > 0 { line += ", dropped \(dropped)" }
+            let late = ring.late.load(ordering: .relaxed)
+            if late > 0 { line += ", late \(late)" }
             line += ", trimmed \(ring.trimmed.load(ordering: .relaxed))"
             log(line)
         }
@@ -1687,6 +1745,10 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         volumes.start()
 
         let alive = AtomicBool(true)
+        // -1 until the receiver says .udpReady; audio stays on TCP for a
+        // receiver that never does.
+        let udpFD = AtomicInt(-1)
+        let alive2 = alive
         Thread {
             readFrames(fd,
                        onAudio: { _, _, _ in },
@@ -1703,8 +1765,39 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
                            // two channels drift apart by however much it took.
                            player.extraDelayMicros.value = ms * 1000
                            log("matching receiver's extra delay: \(ms) ms")
+                       },
+                       onUdpReady: {
+                           var peer = sockaddr_in()
+                           var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+                           let got = withUnsafeMutablePointer(to: &peer) {
+                               $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                   getpeername(fd, $0, &size)
+                               }
+                           }
+                           guard got == 0 else { return }
+                           let dgram = socket(AF_INET, SOCK_DGRAM, 0)
+                           let connected = withUnsafePointer(to: &peer) {
+                               $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                   connect(dgram, $0, size)
+                               }
+                           }
+                           guard connected == 0 else { close(dgram); return }
+                           // Never block the pacing loop for a datagram: a
+                           // full buffer means this chunk is not going out on
+                           // time, and late audio is the one thing datagrams
+                           // exist to not deliver.
+                           _ = fcntl(dgram, F_SETFL, fcntl(dgram, F_GETFL) | O_NONBLOCK)
+                           // The default send buffer is 9216 bytes — ninety
+                           // milliseconds of audio. Any Wi-Fi pause past that
+                           // was dropping chunks at the sender. Two seconds of
+                           // room lets a stall drain instead.
+                           var room: Int32 = 1 << 20
+                           setsockopt(dgram, SOL_SOCKET, SO_SNDBUF, &room,
+                                      socklen_t(MemoryLayout<Int32>.size))
+                           udpFD.value = Int(dgram)
+                           log("audio switching to datagrams")
                        })
-            alive.value = false
+            alive2.value = false
         }.start()
 
         tap.startCapture()
@@ -1778,7 +1871,27 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
             buffer.withMemoryRebound(to: UInt8.self, capacity: chunk * 2) { raw in
                 stamped.append(contentsOf: UnsafeBufferPointer(start: raw, count: chunk * 2))
             }
-            guard sendFrame(fd, .audio, stamped, stamped.count, writeLock) else { break }
+            let dgram = udpFD.value
+            if dgram >= 0 {
+                var frame = [UInt8](repeating: 0, count: 5)
+                frame[0] = Frame.audio.rawValue
+                withUnsafeBytes(of: UInt32(stamped.count).bigEndian) { raw in
+                    for i in 0 ..< 4 { frame[1 + i] = raw[i] }
+                }
+                frame.append(contentsOf: stamped)
+                // A refused datagram is dropped, not retried: its moment will
+                // have passed by the next opportunity, and the schedule sails
+                // on regardless. `sent` advances either way — play times come
+                // from it, and they must track real time, not delivery. But
+                // count what was refused: dropping audio silently is how the
+                // saturated ring hid for days, and this path is no different.
+                let pushed = frame.withUnsafeBytes {
+                    send(Int32(dgram), $0.baseAddress, $0.count, 0)
+                }
+                if pushed < 0 { outbound.dropped.add(chunk, ordering: .relaxed) }
+            } else {
+                guard sendFrame(fd, .audio, stamped, stamped.count, writeLock) else { break }
+            }
             sent += chunk
             let now = DispatchTime.now().uptimeNanoseconds
             if deadline > now {
@@ -1794,6 +1907,63 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
         player.reset()
         log(senderActive.value ? "receiver gone" : "stopped")
     }
+}
+
+/// Everything one session's datagrams need. The UDP thread is the only writer
+/// of the anchor, so it needs no lock; the slot below hands the thread the
+/// current session and takes it away on disconnect, so a straggler datagram
+/// from a dead session falls on the floor instead of on the next one.
+final class UdpAudio: @unchecked Sendable {
+    let player: Player
+    let clock: ClockSync
+    let margin: Margin
+    let announce: (Int) -> Void
+    /// Set on the first datagram; from then on the TCP audio path is ignored,
+    /// including any of its chunks still in flight — they would re-anchor the
+    /// schedule against positions the datagrams have moved past.
+    let active = AtomicBool(false)
+
+    private var anchored = false
+    private var basePosition = 0
+    private var basePlayTime: UInt64 = 0
+
+    init(player: Player, clock: ClockSync, margin: Margin, announce: @escaping (Int) -> Void) {
+        self.player = player
+        self.clock = clock
+        self.margin = margin
+        self.announce = announce
+    }
+
+    func handle(playTime: UInt64, samples: UnsafePointer<Int16>, count: Int) {
+        guard clock.settled else { return }
+        active.value = true
+
+        if !anchored {
+            anchored = true
+            basePosition = player.ring.headPosition
+            basePlayTime = playTime
+            // Anchor once. Positions derive from play times from here on, so
+            // datagrams may arrive in any order and land where they belong.
+            player.schedule.set(position: basePosition, playTime: basePlayTime)
+        }
+        let delta = Int64(bitPattern: playTime &- basePlayTime)
+        let offset = Int((Double(delta) * Double(sampleRate) / 1_000_000_000).rounded())
+        player.ring.write(at: basePosition + offset, samples, count)
+        player.clockOffset.value = Int(clock.offsetNanos)
+
+        let dueLocally = Int64(bitPattern: playTime) - clock.offsetNanos
+            + Int64(player.extraDelayMicros.value) * 1_000
+        margin.observe(marginNanos: dueLocally - Int64(bitPattern: nowNanos()),
+                       extra: player.extraDelayMicros,
+                       announce: announce)
+    }
+}
+
+final class UdpSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: UdpAudio?
+    func set(_ new: UdpAudio?) { lock.lock(); session = new; lock.unlock() }
+    func get() -> UdpAudio? { lock.lock(); defer { lock.unlock() }; return session }
 }
 
 func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
@@ -1818,6 +1988,37 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
     }
     guard bound == 0 else { die("bind: \(String(cString: strerror(errno)))") }
     listen(listener, 1)
+
+    // Audio arrives as datagrams on the same port number. TCP keeps control
+    // and stays as the audio fallback for a sender that never says .udpReady.
+    let datagrams = socket(AF_INET, SOCK_DGRAM, 0)
+    setsockopt(datagrams, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+    let udpBound = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(datagrams, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard udpBound == 0 else { die("udp bind: \(String(cString: strerror(errno)))") }
+    let slot = UdpSlot()
+    Thread {
+        var packet = [UInt8](repeating: 0, count: 2048)
+        while true {
+            let n = recv(datagrams, &packet, packet.count, 0)
+            guard n > 13, packet[0] == Frame.audio.rawValue else { continue }
+            let length = (UInt32(packet[1]) << 24) | (UInt32(packet[2]) << 16)
+                | (UInt32(packet[3]) << 8) | UInt32(packet[4])
+            guard Int(length) == n - 5, length >= 8 else { continue }
+            guard let session = slot.get() else { continue }
+            let playTime = readUInt64(Array(packet[5 ..< 13]), 0)
+            packet.withUnsafeBytes { raw in
+                let samples = raw.baseAddress!.advanced(by: 13)
+                    .assumingMemoryBound(to: Int16.self)
+                session.handle(playTime: playTime, samples: samples,
+                               count: (n - 13) / MemoryLayout<Int16>.size)
+            }
+        }
+    }.start()
+
     log("listening on \(port), target \(targetMs) ms")
 
     let advertiser = Advertiser()
@@ -1836,6 +2037,16 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
 
         let clock = ClockSync()
         let margin = Margin()
+        let announce: (Int) -> Void = { ms in
+            var value = UInt32(ms).bigEndian
+            _ = withUnsafeBytes(of: &value) {
+                sendFrame(client, .delay, $0.baseAddress!, $0.count, writeLock)
+            }
+        }
+        let udp = UdpAudio(player: player, clock: clock, margin: margin, announce: announce)
+        slot.set(udp)
+        var empty: UInt8 = 0
+        _ = sendFrame(client, .udpReady, &empty, 0, writeLock)
         let stop = AtomicBool(false)
         Thread {
             // Keep re-measuring: the estimate improves whenever a round trip
@@ -1856,7 +2067,7 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                        // looks like an enormous shortfall. Dropping the first
                        // fraction of a second costs nothing: playback has not
                        // primed yet, so these frames would be silence anyway.
-                       guard clock.settled else { return }
+                       guard clock.settled, !udp.active.value else { return }
 
                        let position = player.ring.headPosition
                        player.ring.write(samples, count)
@@ -1869,13 +2080,7 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                            + Int64(player.extraDelayMicros.value) * 1_000
                        margin.observe(marginNanos: dueLocally - Int64(bitPattern: nowNanos()),
                                       extra: player.extraDelayMicros,
-                                      announce: { ms in
-                                          var value = UInt32(ms).bigEndian
-                                          _ = withUnsafeBytes(of: &value) {
-                                              sendFrame(client, .delay, $0.baseAddress!,
-                                                        $0.count, writeLock)
-                                          }
-                                      })
+                                      announce: announce)
                    },
                    onVolume: { volumes.applyRemote($0) },
                    onTarget: { ms in
@@ -1887,6 +2092,7 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                        clock.sample(sent: sentAt, remote: remote, received: nowNanos())
                    })
         stop.value = true
+        slot.set(nil)
 
         volumes.stop()
         // Go silent the moment the sender leaves. Without this the buffer keeps

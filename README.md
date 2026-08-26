@@ -85,10 +85,16 @@ StereoPair ──┬── left  channel ─→ this Mac's speakers
 ```
 
 Every copy listens and advertises as `_stereopair._tcp`, so either Mac can start
-the pair. One connection carries everything — audio, volume and the target — as
-framed messages, `[type][length][payload]`. That is why volume mirrors both ways
-with nothing running on the other machine: change it on either Mac and the other
-follows.
+the pair. A TCP connection carries control — volume, the target, clock exchanges
+— as framed messages, `[type][length][payload]`; that is why volume mirrors both
+ways with nothing else running. The audio itself travels as UDP datagrams on the
+same port. TCP is the wrong transport for live audio: one lost packet holds up
+everything behind it until the retransmission lands, and on Wi-Fi those stalls
+compound — measured, a link whose worst single round trip was 89 ms needed over
+600 ms of buffer through TCP. Datagrams need only the single-packet jitter.
+Each carries its play time, so packets may arrive in any order and land where
+they belong; a lost one costs a 5 ms blink of silence instead of a stall. Audio
+falls back to the TCP stream when the receiver never offers datagrams.
 
 The tap excludes this process. That matters twice — our own left-channel
 playback would otherwise be captured straight back into the stream and build
@@ -119,6 +125,14 @@ keeping the fastest exchange in a sliding window — the quickest round trip is
 the one least distorted by queueing, which is exactly what Wi-Fi does badly. It
 then slews towards that estimate at 200 µs per exchange rather than jumping,
 because a step in the offset moves the whole schedule and is audible.
+
+The one case where it does step: an estimate locked during a congested session
+start can be hundreds of milliseconds wrong, and at 200 µs per exchange that
+error outlives the session — margins read wrong on a healthy link and the
+adaptive buffer saturates chasing a gap that is not in the network. When quick
+exchanges, the only trustworthy kind, keep disagreeing with the estimate for
+seconds, it steps to them: one audible skip against a channel offset that never
+goes away.
 
 Holding a fixed buffer level instead, which is the obvious approach, does not
 survive Wi-Fi. Measured with both sides logging: the left channel sat at 149 ms
