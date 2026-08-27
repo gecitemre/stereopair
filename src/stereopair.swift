@@ -949,6 +949,38 @@ enum Frame: UInt8 {
     case timeReply = 4    // UInt64 echo + UInt64 sender clock
     case delay = 5        // UInt32 ms of extra delay the receiver has taken on
     case udpReady = 6     // empty; the receiver accepts audio as datagrams
+    case version = 7      // UTF-8 version string, exchanged at session start
+}
+
+/// The version this build carries, as release.sh stamped it into the bundle.
+let appVersion =
+    Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0"
+
+/// Where the menu learns that the pair is running mismatched versions. The
+/// audio processes cannot talk to the menu directly, so they leave a note:
+/// written when the peer reports a different version, removed when it matches
+/// — matching is the only good news worth acting on.
+let peerVersionNotePath: String = {
+    let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/StereoPair")
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory.appendingPathComponent("peer-version").path
+}()
+
+func notePeerVersion(_ remote: String) {
+    if remote == appVersion {
+        try? FileManager.default.removeItem(atPath: peerVersionNotePath)
+    } else {
+        try? remote.write(toFile: peerVersionNotePath, atomically: true, encoding: .utf8)
+        log("the other Mac runs v\(remote), this is v\(appVersion); update both")
+    }
+}
+
+func sendVersion(_ fd: Int32, _ lock: NSLock) {
+    let bytes = Array(appVersion.utf8)
+    _ = bytes.withUnsafeBytes { raw in
+        sendFrame(fd, .version, raw.baseAddress!, raw.count, lock)
+    }
 }
 
 /// A monotonic clock in nanoseconds, shared by everything that has to agree on
@@ -1089,7 +1121,8 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
                 onTimeRequest: (UInt64) -> Void = { _ in },
                 onTimeReply: (UInt64, UInt64) -> Void = { _, _ in },
                 onDelay: (Int) -> Void = { _ in },
-                onUdpReady: () -> Void = {})
+                onUdpReady: () -> Void = {},
+                onVersion: (String) -> Void = { _ in })
 {
     var header = [UInt8](repeating: 0, count: 5)
     var payload = [UInt8](repeating: 0, count: 1 << 16)
@@ -1121,6 +1154,8 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
             onDelay(Int(ms))
         case .udpReady:
             onUdpReady()
+        case .version:
+            onVersion(String(decoding: payload[0 ..< Int(length)], as: UTF8.self))
         case .timeRequest:
             guard length >= 8 else { return }
             onTimeRequest(readUInt64(payload, 0))
@@ -1745,6 +1780,7 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
             sendFrame(fd, .target, $0.baseAddress!, $0.count, writeLock)
         }
 
+        sendVersion(fd, writeLock)
         let volumes = VolumeSync(fd: fd, lock: writeLock)
         volumes.start()
 
@@ -1800,7 +1836,8 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
                                       socklen_t(MemoryLayout<Int32>.size))
                            udpFD.value = Int(dgram)
                            log("audio switching to datagrams")
-                       })
+                       },
+                       onVersion: { notePeerVersion($0) })
             alive2.value = false
         }.start()
 
@@ -2094,6 +2131,10 @@ func runReceiver(port: UInt16, targetMs: Int, ioFrames: UInt32) -> Never {
                    onTimeRequest: { _ in },
                    onTimeReply: { sentAt, remote in
                        clock.sample(sent: sentAt, remote: remote, received: nowNanos())
+                   },
+                   onVersion: { remote in
+                       notePeerVersion(remote)
+                       sendVersion(client, writeLock)
                    })
         stop.value = true
         slot.set(nil)

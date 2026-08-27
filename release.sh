@@ -60,6 +60,22 @@ xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
 xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 
+# The appcast is how installed copies learn this release exists. It must be
+# uploaded as a release asset named appcast.xml — the feed URL reaches it
+# through releases/latest, so the newest release's copy is always the one seen.
+SPARKLE_KEY="$HOME/.stereopair-sparkle-ed25519"
+if [ -f "$SPARKLE_KEY" ]; then
+	STAGE=$(mktemp -d)
+	cp "$DMG" "$STAGE/"
+	vendor/bin/generate_appcast --ed-key-file "$SPARKLE_KEY" \
+		--download-url-prefix "https://github.com/gecitemre/stereopair/releases/download/v$VERSION/" \
+		-o bin/appcast.xml "$STAGE" >/dev/null
+	rm -rf "$STAGE"
+	echo "bin/appcast.xml written; upload it with the DMG"
+else
+	echo "release: no Sparkle key at $SPARKLE_KEY; skipping appcast" >&2
+fi
+
 echo
 echo "$DMG is ready to hand out"
 spctl --assess --type open --context context:primary-signature -v "$DMG" 2>&1 | sed 's/^/  /'

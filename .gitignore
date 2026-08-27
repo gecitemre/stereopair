@@ -10,3 +10,4 @@ channel-check.wav
 bin/StereoPair.app/
 bin/Lowlat.app/
 bin/*.dmg
+vendor/

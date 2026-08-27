@@ -7,6 +7,7 @@
 
 import AppKit
 import ServiceManagement
+import Sparkle
 
 @MainActor
 final class Menu: NSObject, NSMenuDelegate {
@@ -22,6 +23,10 @@ final class Menu: NSObject, NSMenuDelegate {
     private var rotating = false
     private var room = Room.off
 
+    private let updater = SPUStandardUpdaterController(startingUpdater: true,
+                                                       updaterDelegate: nil,
+                                                       userDriverDelegate: nil)
+    private let versionWarning = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var receiver: Process?
     private var sender: Process?
     private let discovery = LiveDiscovery()
@@ -63,10 +68,18 @@ final class Menu: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         statusLine.isEnabled = false
         menu.addItem(statusLine)
+        versionWarning.isEnabled = false
+        versionWarning.isHidden = true
+        menu.addItem(versionWarning)
         menu.addItem(.separator())
 
         loginItem.target = self
         menu.addItem(loginItem)
+        let updateItem = NSMenuItem(title: "Check for Updates…",
+                                    action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
+                                    keyEquivalent: "")
+        updateItem.target = updater
+        menu.addItem(updateItem)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         menu.items.last?.target = self
 
@@ -245,6 +258,13 @@ final class Menu: NSObject, NSMenuDelegate {
         sendItem.isEnabled = !isSending
 
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+
+        if let peer = try? String(contentsOfFile: peerVersionNotePath, encoding: .utf8) {
+            versionWarning.title = "⚠ Other Mac runs v\(peer) — update both Macs"
+            versionWarning.isHidden = false
+        } else {
+            versionWarning.isHidden = true
+        }
 
         let symbol = isSending ? "speaker.wave.2.fill" : "speaker.slash"
         statusItem.button?.image = NSImage(systemSymbolName: symbol,
