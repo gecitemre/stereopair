@@ -1128,7 +1128,11 @@ func readFrames(_ fd: Int32, onAudio: (UInt64, UnsafePointer<Int16>, Int) -> Voi
             guard length >= 16 else { return }
             onTimeReply(readUInt64(payload, 0), readUInt64(payload, 1))
         case nil:
-            return          // unknown frame type: the stream is no longer trustworthy
+            // A frame type from a newer version. The length prefix has already
+            // walked us past its payload, so framing is intact — skip it. This
+            // is what lets a v1.5 pair with a v1.6: dropping the session here
+            // turned every future protocol addition into a breaking change.
+            continue
         }
     }
 }
