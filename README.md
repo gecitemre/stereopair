@@ -13,6 +13,16 @@ shipped the combination on macOS.
 > **Vibe-coded.** Built with Claude Code (Opus 5). The latency and buffer
 > figures are measured on real hardware, not estimated.
 
+## Download
+
+**[Download the latest StereoPair.dmg](https://github.com/gecitemre/stereopair/releases/latest)** — signed and notarized, no build tools needed.
+
+1. Install it on **both** Macs (drag to Applications, open).
+2. Allow the two permissions macOS asks for — system audio recording and local network. It is silent without them.
+3. On the Mac in front of you: menu bar icon → **Play On**.
+
+The app updates itself from here on.
+
 ## Use
 
 Put `StereoPair.app` on both Macs and open it on both. On the one you listen
