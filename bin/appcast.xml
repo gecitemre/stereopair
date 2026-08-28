@@ -1,0 +1,15 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>StereoPair</title>
+        <item>
+            <title>1.6</title>
+            <pubDate>Thu, 27 Aug 2026 10:49:16 +0300</pubDate>
+            <sparkle:version>1.6</sparkle:version>
+            <sparkle:shortVersionString>1.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.4</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/gecitemre/stereopair/releases/download/v1.6/StereoPair-1.6.dmg" length="1526845" type="application/octet-stream" sparkle:edSignature="8rPRHYqEePMcGCuCWfa3CrZ6LDbYuUQEuuqgo3JbrpDXbv9OqNMBWQc7yvXMhRKCqht6eW7szH7jVbgcRA4ABg=="/>
+        </item>
+    </channel>
+</rss>

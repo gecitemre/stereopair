@@ -460,6 +460,7 @@ final class Player {
     func reset() {
         ring.clear()
         primedFlag.value = false
+        timingErrorMicros.value = 0
         // Extra delay belongs to a link, not to a machine. Carrying it into the
         // next session puts the receiver behind by whatever the last one needed
         // — the sender starts every session at zero, and only learns otherwise
@@ -1027,6 +1028,20 @@ final class ClockSync: @unchecked Sendable {
         return applied
     }
 
+    /// One line answering the question the logs could never answer: is the
+    /// estimate wrong, or is the network genuinely this bad? `disagree` is how
+    /// far the window's most trustworthy exchange sits from what is applied —
+    /// near zero means the clock is fine and the lateness is real.
+    var diagnostics: String {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let best = window.min(by: { $0.roundTrip < $1.roundTrip }) else {
+            return "clock: no samples"
+        }
+        return "clock: disagree \((best.offset - applied) / 1_000_000) ms, "
+            + "best rtt \(best.roundTrip / 1_000_000) ms, window \(window.count)"
+    }
+
     func sample(sent: UInt64, remote: UInt64, received: UInt64) {
         let roundTrip = received &- sent
         let midpoint = sent &+ roundTrip / 2
@@ -1566,7 +1581,11 @@ final class Margin: @unchecked Sendable {
     /// not a delay but dropped audio wearing one — and at 300 ms, because the
     /// point of this is to survive a rough patch, not to keep buying latency
     /// until the pair is a second and a half behind the music.
-    private let ceilingMicros = min(300_000, ringFrames * 1_000_000 / sampleRate / 4)
+    // Sized by defeat, honestly: 300 pinned with 70 ms still short, 500
+    // pinned with 96 still short, all with the clock proven right — on a bad
+    // evening this Wi-Fi's interface queue oscillates most of a second, and
+    // the choice is latency or starvation. Music tolerates latency.
+    private let ceilingMicros = min(800_000, ringFrames * 1_000_000 / sampleRate / 4)
     private let maxGrowthMicros = 150_000
 
     /// Extra delay has to be applied on both machines or it becomes a channel
@@ -1699,6 +1718,16 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
     let tap = Tap(left: player.ring, right: outbound)
     liveTap = tap
     tap.effects.startWatching()
+    // The stats thread watches the left ring; datagrams the link refused are
+    // counted on the outbound one and were invisible — one more silent-discard
+    // blind spot, found the expensive way.
+    Thread {
+        while true {
+            Thread.sleep(forTimeInterval: 10)
+            let refused = outbound.dropped.load(ordering: .relaxed)
+            if refused > 0 { log("link refused \(refused * 1000 / sampleRate) ms of audio so far") }
+        }
+    }.start()
     log("ready" + (startIdle ? " (idle)" : ""))
     startStatsThread("left", player)
 
@@ -1827,11 +1856,20 @@ func runSender(host: String, port: UInt16, targetMs: Int, ioFrames: UInt32,
                            // time, and late audio is the one thing datagrams
                            // exist to not deliver.
                            _ = fcntl(dgram, F_SETFL, fcntl(dgram, F_GETFL) | O_NONBLOCK)
-                           // The default send buffer is 9216 bytes — ninety
-                           // milliseconds of audio. Any Wi-Fi pause past that
-                           // was dropping chunks at the sender. Two seconds of
-                           // room lets a stall drain instead.
-                           var room: Int32 = 1 << 20
+                           // The send buffer IS the queue bound. A stall
+                           // backs packets up in it, and once the link
+                           // recovers the backlog never drains — inflow
+                           // matches outflow — so whatever fits becomes
+                           // permanent lateness: 64 KB here sat at a flat
+                           // 644 ms with the clock proven right. Asking the
+                           // kernel how full it is looked cleverer: SO_NWRITE
+                           // read zero all session and that cap never fired.
+                           // At 24 KB a burst rides through, a real stall
+                           // fills it in a quarter second, and past that
+                           // send() itself refuses — landing in the
+                           // drop-and-count path below, which is what the
+                           // clever version was supposed to do.
+                           var room: Int32 = 24 * 1024
                            setsockopt(dgram, SOL_SOCKET, SO_SNDBUF, &room,
                                       socklen_t(MemoryLayout<Int32>.size))
                            udpFD.value = Int(dgram)
@@ -1967,6 +2005,7 @@ final class UdpAudio: @unchecked Sendable {
     private var anchored = false
     private var basePosition = 0
     private var basePlayTime: UInt64 = 0
+    private var lastClockReport = nowNanos()
 
     init(player: Player, clock: ClockSync, margin: Margin, announce: @escaping (Int) -> Void) {
         self.player = player
@@ -1997,6 +2036,12 @@ final class UdpAudio: @unchecked Sendable {
         margin.observe(marginNanos: dueLocally - Int64(bitPattern: nowNanos()),
                        extra: player.extraDelayMicros,
                        announce: announce)
+
+        let now = nowNanos()
+        if now &- lastClockReport > 10_000_000_000 {
+            lastClockReport = now
+            log(clock.diagnostics)
+        }
     }
 }
 
